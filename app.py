@@ -1592,36 +1592,48 @@ class PerformanceDashboard:
             current_exec = current_data.get('executive_snapshot', {})
             previous_exec = previous_data.get('executive_snapshot', {})
             
+            # Calculate growth percentages
+            new_customers_growth = self._calculate_growth(
+                current_exec.get('new_customers_total', 0),
+                previous_exec.get('new_customers_total', 0)
+            )
+            active_customers_growth = self._calculate_growth(
+                current_exec.get('active_customers_all', 0),
+                previous_exec.get('active_customers_all', 0)
+            )
+            wau_growth = self._calculate_growth(
+                current_exec.get('wau_total', 0),
+                previous_exec.get('wau_total', 0)
+            )
+            
             wow_data.append({
                 'Comparison': f'{current_period} vs {previous_period}',
                 'New Customers': current_exec.get('new_customers_total', 0),
-                'New Customers WoW': self._calculate_growth(
-                    current_exec.get('new_customers_total', 0),
-                    previous_exec.get('new_customers_total', 0)
-                ),
+                'New Customers WoW': new_customers_growth,
                 'Active Customers': current_exec.get('active_customers_all', 0),
-                'Active Customers WoW': self._calculate_growth(
-                    current_exec.get('active_customers_all', 0),
-                    previous_exec.get('active_customers_all', 0)
-                ),
+                'Active Customers WoW': active_customers_growth,
                 'WAU': current_exec.get('wau_total', 0),
-                'WAU WoW': self._calculate_growth(
-                    current_exec.get('wau_total', 0),
-                    previous_exec.get('wau_total', 0)
-                )
+                'WAU WoW': wau_growth
             })
         
         if wow_data:
             wow_df = pd.DataFrame(wow_data)
+            
+            # Replace None values with 0 for plotting
+            plot_df = wow_df.copy()
+            for col in ['New Customers WoW', 'Active Customers WoW', 'WAU WoW']:
+                plot_df[col] = plot_df[col].apply(lambda x: 0 if x is None else x)
+            
             st.dataframe(wow_df, use_container_width=True, hide_index=True)
             
             # Visualization
             fig = px.bar(
-                wow_df,
+                plot_df,
                 x='Comparison',
                 y=['New Customers WoW', 'Active Customers WoW', 'WAU WoW'],
                 title="WoW Growth Comparison (%)",
-                barmode='group'
+                barmode='group',
+                labels={'value': 'Growth %', 'variable': 'Metric'}
             )
             fig.update_layout(xaxis_tickangle=-45)
             st.plotly_chart(fig, use_container_width=True)
