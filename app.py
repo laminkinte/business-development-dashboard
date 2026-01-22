@@ -25,6 +25,12 @@ if 'onboarding' not in st.session_state:
     st.session_state.onboarding = None
 if 'period_data' not in st.session_state:
     st.session_state.period_data = None
+if 'date_range_set' not in st.session_state:
+    st.session_state.date_range_set = False
+if 'start_date' not in st.session_state:
+    st.session_state.start_date = datetime(2025, 10, 1)
+if 'end_date' not in st.session_state:
+    st.session_state.end_date = min(datetime(2026, 1, 14), datetime.now())
 
 class DatabaseManager:
     def __init__(self):
@@ -44,7 +50,8 @@ class DatabaseManager:
                 connect_timeout=10
             )
             return True
-        except Exception:
+        except Exception as e:
+            st.error(f"Database connection error: {str(e)}")
             return False
     
     def disconnect(self):
@@ -67,17 +74,14 @@ class DatabaseManager:
                     return pd.DataFrame(result)
                 else:
                     return pd.DataFrame()
-        except Exception:
+        except Exception as e:
+            st.error(f"Query execution error: {str(e)}")
             return pd.DataFrame()
 
 class PerformanceDashboard:
     def __init__(self):
         self.db = DatabaseManager()
         self.today = datetime.now()
-        
-        # Define dynamic date ranges - these will be set by user
-        self.start_date_overall = None
-        self.end_date_overall = None
         
         # Define product categories
         self.product_categories = {
@@ -88,7 +92,7 @@ class PerformanceDashboard:
             'Cash Power': ['Nawec Cashpower'],
             'E-Ticketing': ['Ticket'],
             'Bank Transfers': ['BANK_TO_WALLET_TRANSFER', 'WALLET_TO_BANK_TRANSFER'],
-            'Airtime': ['Airtime Topup'],  # Changed to match service name
+            'Airtime': ['Airtime Topup'],
             'International': ['International Remittance'],
             'Money Transfer': ['Scan to Send Money', 'Wallet to Non Wallet Transfer'],
             'Add Money': ['Add Money'],
@@ -103,6 +107,9 @@ class PerformanceDashboard:
         """Set the date range for analysis"""
         self.start_date_overall = start_date
         self.end_date_overall = end_date
+        st.session_state.start_date = start_date
+        st.session_state.end_date = end_date
+        st.session_state.date_range_set = True
     
     def load_data_from_db(self, start_date, end_date):
         """Load data from MySQL database for given date range"""
@@ -128,12 +135,13 @@ class PerformanceDashboard:
             
             if transactions.empty:
                 st.warning("No transaction data found for the selected period")
+                self.db.disconnect()
                 return False
             
             # Standardize column names
             column_mapping = {}
             for col in transactions.columns:
-                col_lower = col.lower().replace(' ', '_')
+                col_lower = str(col).lower().replace(' ', '_')
                 if 'created' in col_lower:
                     column_mapping[col] = 'Created_At'
                 elif 'product' in col_lower:
@@ -196,7 +204,7 @@ class PerformanceDashboard:
                 # Standardize column names
                 onboarding_columns = {}
                 for col in onboarding.columns:
-                    col_lower = col.lower().replace(' ', '_')
+                    col_lower = str(col).lower().replace(' ', '_')
                     if 'registration' in col_lower:
                         onboarding_columns[col] = 'Registration_Date'
                     elif 'mobile' in col_lower:
@@ -241,6 +249,9 @@ class PerformanceDashboard:
     
     def get_report_periods(self, period_type='monthly'):
         """Get report periods based on selected period type"""
+        if not hasattr(self, 'start_date_overall') or self.start_date_overall is None:
+            return []
+            
         periods = []
         
         if period_type == 'monthly':
@@ -449,10 +460,10 @@ class PerformanceDashboard:
                         product_counts_dict['Airtime Topup'] = len(airtime_transactions)
                 
                 # Convert to Series for sorting
-                product_counts = pd.Series(product_counts_dict)
-                product_counts = product_counts.sort_values(ascending=False)
-                
-                if not product_counts.empty:
+                if product_counts_dict:
+                    product_counts = pd.Series(product_counts_dict)
+                    product_counts = product_counts.sort_values(ascending=False)
+                    
                     # Get top performing product
                     top_product = product_counts.index[0]
                     top_product_count = int(product_counts.iloc[0])
@@ -1059,12 +1070,18 @@ class PerformanceDashboard:
         """Display the main dashboard"""
         st.title("📊 Business Development Performance Dashboard")
         
-        # Date range info
+        # Date range info - use session state dates
         col1, col2, col3 = st.columns(3)
         with col1:
-            st.metric("Report Start", self.start_date_overall.strftime('%Y-%m-%d'))
+            if hasattr(self, 'start_date_overall') and self.start_date_overall is not None:
+                st.metric("Report Start", self.start_date_overall.strftime('%Y-%m-%d'))
+            else:
+                st.metric("Report Start", st.session_state.start_date.strftime('%Y-%m-%d'))
         with col2:
-            st.metric("Report End", self.end_date_overall.strftime('%Y-%m-%d'))
+            if hasattr(self, 'end_date_overall') and self.end_date_overall is not None:
+                st.metric("Report End", self.end_date_overall.strftime('%Y-%m-%d'))
+            else:
+                st.metric("Report End", st.session_state.end_date.strftime('%Y-%m-%d'))
         with col3:
             st.metric("Total Periods", len(all_period_data))
         
@@ -1625,19 +1642,17 @@ def main():
     # Date range selector
     st.sidebar.subheader("📅 Date Range Selection")
     
-    default_start = datetime(2025, 10, 1)
-    default_end = min(datetime(2026, 1, 14), datetime.now())
-    
+    # Use session state dates as defaults
     start_date = st.sidebar.date_input(
         "Start Date",
-        value=default_start,
+        value=st.session_state.start_date,
         min_value=datetime(2024, 1, 1),
         max_value=datetime.now()
     )
     
     end_date = st.sidebar.date_input(
         "End Date",
-        value=default_end,
+        value=st.session_state.end_date,
         min_value=datetime(2024, 1, 1),
         max_value=datetime.now()
     )
@@ -1692,6 +1707,13 @@ def main():
     else:
         st.title("📊 Business Development Performance Dashboard")
         st.info("📥 Please select date range and click 'Load Data' to begin")
+        
+        # Show default date range if no data loaded
+        col1, col2 = st.columns(2)
+        with col1:
+            st.metric("Default Start Date", st.session_state.start_date.strftime('%Y-%m-%d'))
+        with col2:
+            st.metric("Default End Date", st.session_state.end_date.strftime('%Y-%m-%d'))
 
 if __name__ == "__main__":
     main()
