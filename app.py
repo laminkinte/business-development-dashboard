@@ -16,6 +16,16 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
+# Initialize session state for data persistence
+if 'data_loaded' not in st.session_state:
+    st.session_state.data_loaded = False
+if 'transactions' not in st.session_state:
+    st.session_state.transactions = None
+if 'onboarding' not in st.session_state:
+    st.session_state.onboarding = None
+if 'period_data' not in st.session_state:
+    st.session_state.period_data = None
+
 class DatabaseManager:
     def __init__(self):
         self.connection = None
@@ -35,7 +45,7 @@ class DatabaseManager:
             )
             return True
         except Exception as e:
-            st.error(f"❌ Error connecting to MySQL database: {str(e)}")
+            st.error(f"❌ Database connection error")
             return False
     
     def disconnect(self):
@@ -59,7 +69,7 @@ class DatabaseManager:
                 else:
                     return pd.DataFrame()
         except Exception as e:
-            st.error(f"❌ Error executing query: {str(e)}")
+            st.error(f"❌ Query execution error")
             return pd.DataFrame()
 
 class PerformanceDashboard:
@@ -71,7 +81,7 @@ class PerformanceDashboard:
         self.start_date_overall = datetime(2025, 10, 1)
         self.end_date_overall = min(datetime(2026, 1, 14), self.today)
         
-        # Product categories - UPDATED based on your database
+        # Product categories
         self.product_categories = {
             'P2P (Internal Wallet Transfer)': ['Internal Wallet Transfer'],
             'Cash-In': ['Deposit'],
@@ -96,9 +106,11 @@ class PerformanceDashboard:
             return False
         
         try:
-            st.info("📥 Loading transaction data from database...")
+            # Show loading indicator
+            progress_text = "Loading data from database..."
+            progress_bar = st.progress(0, text=progress_text)
             
-            # Use the correct column names from your database
+            # Load transaction data
             transaction_query = """
                 SELECT 
                     id,
@@ -108,7 +120,6 @@ class PerformanceDashboard:
                     transaction_type,
                     amount,
                     status,
-                    internal_status,
                     service_name,
                     ucp_name,
                     created_at,
@@ -119,27 +130,28 @@ class PerformanceDashboard:
                 AND created_at <= %s
             """
             
-            self.transactions = self.db.execute_query(
+            progress_bar.progress(30, text="Loading transaction data...")
+            transactions = self.db.execute_query(
                 transaction_query, 
                 (self.start_date_overall, self.end_date_overall)
             )
             
-            if self.transactions.empty:
-                st.warning("⚠️ No transaction data found for the specified period")
+            if transactions.empty:
+                st.warning("⚠️ No transaction data found")
                 return False
             
-            st.success(f"✅ Loaded {len(self.transactions)} transaction records")
+            progress_bar.progress(60, text="Processing transaction data...")
             
             # Parse dates in transactions
-            if 'created_at' in self.transactions.columns:
-                self.transactions['created_at'] = pd.to_datetime(
-                    self.transactions['created_at'], errors='coerce'
+            if 'created_at' in transactions.columns:
+                transactions['created_at'] = pd.to_datetime(
+                    transactions['created_at'], errors='coerce'
                 )
             
             # Clean numeric columns
-            if 'amount' in self.transactions.columns:
-                self.transactions['amount'] = pd.to_numeric(
-                    self.transactions['amount'].astype(str)
+            if 'amount' in transactions.columns:
+                transactions['amount'] = pd.to_numeric(
+                    transactions['amount'].astype(str)
                     .str.replace(',', '')
                     .str.replace(' ', '')
                     .str.replace('D', '')
@@ -149,8 +161,8 @@ class PerformanceDashboard:
                     errors='coerce'
                 )
             
-            # Standardize column names for internal use
-            self.transactions = self.transactions.rename(columns={
+            # Standardize column names
+            transactions = transactions.rename(columns={
                 'user_identifier': 'User_Identifier',
                 'entity_name': 'Entity_Name',
                 'product_name': 'Product_Name',
@@ -163,30 +175,14 @@ class PerformanceDashboard:
             })
             
             # Load onboarding data
-            st.info("📥 Loading onboarding data from database...")
+            progress_bar.progress(80, text="Loading onboarding data...")
             
             onboarding_query = """
                 SELECT 
-                    account_id,
-                    full_name,
                     mobile,
-                    email,
-                    region,
-                    district,
-                    town_village,
-                    business_name,
+                    entity,
                     kyc_status,
                     registration_date,
-                    updated_at,
-                    proof_of_id,
-                    identification_number,
-                    customer_referrer_code,
-                    customer_referrer_mobile,
-                    referrer_entity,
-                    entity,
-                    bank,
-                    bank_account_name,
-                    bank_account_number,
                     status
                 FROM Onboarding 
                 WHERE registration_date IS NOT NULL 
@@ -194,22 +190,22 @@ class PerformanceDashboard:
                 AND registration_date <= %s
             """
             
-            self.onboarding = self.db.execute_query(
+            onboarding = self.db.execute_query(
                 onboarding_query,
                 (self.start_date_overall, self.end_date_overall)
             )
             
-            if not self.onboarding.empty:
-                st.success(f"✅ Loaded {len(self.onboarding)} onboarding records")
-                
+            progress_bar.progress(90, text="Processing onboarding data...")
+            
+            if not onboarding.empty:
                 # Parse dates in onboarding
-                if 'registration_date' in self.onboarding.columns:
-                    self.onboarding['registration_date'] = pd.to_datetime(
-                        self.onboarding['registration_date'], errors='coerce'
+                if 'registration_date' in onboarding.columns:
+                    onboarding['registration_date'] = pd.to_datetime(
+                        onboarding['registration_date'], errors='coerce'
                     )
                 
                 # Standardize column names
-                self.onboarding = self.onboarding.rename(columns={
+                onboarding = onboarding.rename(columns={
                     'mobile': 'Mobile',
                     'entity': 'Entity',
                     'kyc_status': 'KYC_Status',
@@ -217,28 +213,28 @@ class PerformanceDashboard:
                     'registration_date': 'Registration_Date'
                 })
                 
-                # Create User Identifier for merging
-                self.onboarding['User_Identifier'] = self.onboarding['Mobile'].astype(str).str.strip()
+                # Create User Identifier
+                onboarding['User_Identifier'] = onboarding['Mobile'].astype(str).str.strip()
             else:
-                st.warning("⚠️ No onboarding data found for the specified period")
-                self.onboarding = pd.DataFrame()
+                onboarding = pd.DataFrame()
             
             self.db.disconnect()
+            progress_bar.progress(100, text="Data loaded successfully!")
             
-            # Show data summary
-            st.success("✅ Data loaded successfully!")
-            col1, col2 = st.columns(2)
-            with col1:
-                st.metric("Transactions Loaded", len(self.transactions))
-            with col2:
-                st.metric("Onboarding Records", len(self.onboarding))
+            # Store in session state
+            st.session_state.transactions = transactions
+            st.session_state.onboarding = onboarding
+            st.session_state.data_loaded = True
+            
+            # Small delay to show completion
+            import time
+            time.sleep(0.5)
+            progress_bar.empty()
             
             return True
             
         except Exception as e:
-            st.error(f"❌ Error loading data: {str(e)}")
-            import traceback
-            st.error(traceback.format_exc())
+            st.error(f"❌ Error loading data")
             if self.db.connection:
                 self.db.disconnect()
             return False
@@ -250,11 +246,12 @@ class PerformanceDashboard:
         
         while start_date <= self.end_date_overall:
             period_end = min(start_date + timedelta(days=6), self.end_date_overall)
-            period_name = f"{start_date.strftime('%b %d')} - {period_end.strftime('%b %d')}"
-            rolling_periods.append((period_name, start_date, period_end, 'rolling'))
+            if (period_end - start_date).days >= 6:  # Only include full weeks
+                period_name = f"{start_date.strftime('%b %d')} - {period_end.strftime('%b %d')}"
+                rolling_periods.append((period_name, start_date, period_end, 'rolling'))
             start_date = start_date + timedelta(days=7)
         
-        return rolling_periods[-8:]  # Last 8 rolling periods
+        return rolling_periods[-8:] if len(rolling_periods) > 8 else rolling_periods
     
     def get_weekly_monthly_periods(self):
         """Get standard weekly and monthly periods"""
@@ -304,17 +301,12 @@ class PerformanceDashboard:
         
         # Filter onboarding for period
         period_onboarding = self.filter_by_date_range(
-            self.onboarding, 'Registration_Date', start_date, end_date
+            st.session_state.onboarding, 'Registration_Date', start_date, end_date
         )
         
         # Get customer counts
         if not period_onboarding.empty and 'Entity' in period_onboarding.columns:
             customer_counts = {}
-            # Check what status values actually exist
-            if 'Status' in period_onboarding.columns:
-                unique_statuses = period_onboarding['Status'].unique()
-                st.info(f"📊 Found status values: {list(unique_statuses)}")
-            
             for status in ['Active', 'Registered', 'TemporaryRegister']:
                 status_customers = period_onboarding[
                     (period_onboarding['Entity'] == 'Customer') & 
@@ -334,7 +326,7 @@ class PerformanceDashboard:
         
         # Get active customers
         period_transactions = self.filter_by_date_range(
-            self.transactions, 'Created_At', start_date, end_date
+            st.session_state.transactions, 'Created_At', start_date, end_date
         )
         
         if not period_transactions.empty:
@@ -361,10 +353,6 @@ class PerformanceDashboard:
             ]
             
             if not customer_transactions.empty:
-                # Check what products exist
-                unique_products = customer_transactions['Product_Name'].unique()
-                st.info(f"📊 Found products: {list(unique_products)}")
-                
                 # Handle P2P transactions
                 p2p_mask = (customer_transactions['Product_Name'] == 'Internal Wallet Transfer')
                 if 'Transaction_Type' in customer_transactions.columns:
@@ -407,11 +395,11 @@ class PerformanceDashboard:
         
         # Filter data for period
         period_onboarding = self.filter_by_date_range(
-            self.onboarding, 'Registration_Date', start_date, end_date
+            st.session_state.onboarding, 'Registration_Date', start_date, end_date
         )
         
         period_transactions = self.filter_by_date_range(
-            self.transactions, 'Created_At', start_date, end_date
+            st.session_state.transactions, 'Created_At', start_date, end_date
         )
         
         # New registrations
@@ -465,7 +453,7 @@ class PerformanceDashboard:
     def calculate_product_usage(self, start_date, end_date, period_type):
         """Calculate Product Usage metrics"""
         period_transactions = self.filter_by_date_range(
-            self.transactions, 'Created_At', start_date, end_date
+            st.session_state.transactions, 'Created_At', start_date, end_date
         )
         
         product_metrics = {}
@@ -475,16 +463,6 @@ class PerformanceDashboard:
                 (period_transactions['Entity_Name'] == 'Customer') &
                 (period_transactions['Status'] == 'SUCCESS')
             ]
-            
-            if not customer_transactions.empty:
-                # Check what products and services exist
-                if 'Product_Name' in customer_transactions.columns:
-                    unique_products = customer_transactions['Product_Name'].dropna().unique()
-                    st.info(f"📊 Products in transactions: {list(unique_products)}")
-                
-                if 'Service_Name' in customer_transactions.columns:
-                    unique_services = customer_transactions['Service_Name'].dropna().unique()
-                    st.info(f"📊 Services in transactions: {list(unique_services)}")
             
             for category, products in self.product_categories.items():
                 for product in products:
@@ -556,7 +534,7 @@ class PerformanceDashboard:
     def calculate_customer_activity(self, start_date, end_date, period_type):
         """Calculate Customer Activity metrics"""
         period_transactions = self.filter_by_date_range(
-            self.transactions, 'Created_At', start_date, end_date
+            st.session_state.transactions, 'Created_At', start_date, end_date
         )
         
         metrics = {}
@@ -607,46 +585,46 @@ class PerformanceDashboard:
     
     def generate_period_report(self):
         """Generate report for all periods"""
+        if not st.session_state.data_loaded:
+            return {}
+            
         report_periods = self.get_report_periods()
         all_period_data = {}
         
-        with st.spinner("Generating reports for all periods..."):
-            if report_periods:
-                progress_bar = st.progress(0)
-                total_periods = len(report_periods)
+        if report_periods:
+            progress_bar = st.progress(0, text="Generating reports...")
+            total_periods = len(report_periods)
+            
+            for idx, (period_name, start_date, end_date, period_type) in enumerate(report_periods):
+                progress_bar.progress((idx + 1) / total_periods, text=f"Processing {period_name}")
                 
-                for idx, (period_name, start_date, end_date, period_type) in enumerate(report_periods):
-                    progress_bar.progress((idx + 1) / total_periods)
-                    
-                    period_data = {
-                        'period_name': period_name,
-                        'start_date': start_date,
-                        'end_date': end_date,
-                        'period_type': period_type
-                    }
-                    
-                    # Calculate all metrics
-                    period_data['executive_snapshot'] = self.calculate_executive_snapshot(
-                        start_date, end_date, period_type
-                    )
-                    
-                    period_data['customer_acquisition'] = self.calculate_customer_acquisition(
-                        start_date, end_date
-                    )
-                    
-                    period_data['product_usage'] = self.calculate_product_usage(
-                        start_date, end_date, period_type
-                    )
-                    
-                    period_data['customer_activity'] = self.calculate_customer_activity(
-                        start_date, end_date, period_type
-                    )
-                    
-                    all_period_data[period_name] = period_data
+                period_data = {
+                    'period_name': period_name,
+                    'start_date': start_date,
+                    'end_date': end_date,
+                    'period_type': period_type
+                }
                 
-                progress_bar.empty()
-            else:
-                st.warning("No report periods generated")
+                # Calculate all metrics
+                period_data['executive_snapshot'] = self.calculate_executive_snapshot(
+                    start_date, end_date, period_type
+                )
+                
+                period_data['customer_acquisition'] = self.calculate_customer_acquisition(
+                    start_date, end_date
+                )
+                
+                period_data['product_usage'] = self.calculate_product_usage(
+                    start_date, end_date, period_type
+                )
+                
+                period_data['customer_activity'] = self.calculate_customer_activity(
+                    start_date, end_date, period_type
+                )
+                
+                all_period_data[period_name] = period_data
+            
+            progress_bar.empty()
         
         return all_period_data
     
@@ -666,10 +644,29 @@ class PerformanceDashboard:
         st.divider()
         
         if all_period_data:
-            # Period selection
+            # Period selection in sidebar
             period_names = list(all_period_data.keys())
-            selected_period = st.selectbox(
-                "Select Period to View",
+            
+            # Add filters in sidebar
+            st.sidebar.subheader("🔍 Filters")
+            
+            # Period type filter
+            period_types = ['All', 'Monthly', 'Weekly', 'Rolling']
+            selected_period_type = st.sidebar.selectbox(
+                "Filter by Period Type",
+                period_types,
+                index=0
+            )
+            
+            if selected_period_type != 'All':
+                filtered_periods = {k: v for k, v in all_period_data.items() 
+                                  if v['period_type'] == selected_period_type.lower()}
+                if filtered_periods:
+                    period_names = list(filtered_periods.keys())
+                    all_period_data = filtered_periods
+            
+            selected_period = st.sidebar.selectbox(
+                "Select Period",
                 period_names,
                 index=len(period_names)-1 if period_names else 0,
                 key="period_selector"
@@ -724,16 +721,16 @@ class PerformanceDashboard:
                 st.metric("Top Product", f"{top_product} ({top_count})")
         
         # Detailed metrics in expanders
-        with st.expander("📊 Executive Snapshot Details", expanded=True):
+        with st.expander("📊 Executive Snapshot Details", expanded=False):
             self.display_executive_details(period_data)
         
-        with st.expander("👥 Customer Acquisition Details"):
+        with st.expander("👥 Customer Acquisition Details", expanded=False):
             self.display_acquisition_details(period_data)
         
-        with st.expander("📱 Product Usage Details"):
+        with st.expander("📱 Product Usage Details", expanded=False):
             self.display_product_details(period_data)
         
-        with st.expander("⚡ Customer Activity Details"):
+        with st.expander("⚡ Customer Activity Details", expanded=False):
             self.display_activity_details(period_data)
     
     def display_executive_details(self, period_data):
@@ -801,7 +798,7 @@ class PerformanceDashboard:
                 'Category': metrics.get('category', ''),
                 'Active Users': metrics.get('active_users', 0),
                 'Total Transactions': metrics.get('total_transactions', 0),
-                'Transaction Value': metrics.get('total_amount', 0),
+                'Transaction Value': f"${metrics.get('total_amount', 0):,.2f}",
                 'Unique Users': metrics.get('unique_users', 0)
             })
         
@@ -822,7 +819,7 @@ class PerformanceDashboard:
                     color='Category',
                     title="Top 10 Products by Transactions"
                 )
-                fig.update_layout(xaxis_tickangle=-45)
+                fig.update_layout(xaxis_tickangle=-45, showlegend=True)
                 st.plotly_chart(fig, use_container_width=True)
             
             with tab2:
@@ -835,7 +832,7 @@ class PerformanceDashboard:
                     color='Category',
                     title="Top 10 Products by Active Users"
                 )
-                fig.update_layout(xaxis_tickangle=-45)
+                fig.update_layout(xaxis_tickangle=-45, showlegend=True)
                 st.plotly_chart(fig, use_container_width=True)
     
     def display_activity_details(self, period_data):
@@ -969,7 +966,7 @@ class PerformanceDashboard:
                 color='Category',
                 title="Top 10 Products by Transactions"
             )
-            fig.update_layout(xaxis_tickangle=-45)
+            fig.update_layout(xaxis_tickangle=-45, showlegend=True)
             st.plotly_chart(fig, use_container_width=True)
 
 # Main Streamlit app
@@ -979,66 +976,68 @@ def main():
     # Initialize dashboard
     dashboard = PerformanceDashboard()
     
-    # Load data button with unique key
-    if st.sidebar.button("🔄 Load Data from Database", type="primary", key="load_data_button"):
-        with st.spinner("Loading data from database..."):
+    # Auto-load data on first run
+    if not st.session_state.data_loaded:
+        with st.spinner("📥 Loading data from database..."):
             if dashboard.load_data_from_db():
-                st.sidebar.success("✅ Data loaded successfully!")
-                
                 # Generate reports
-                all_period_data = dashboard.generate_period_report()
-                
-                # Display dashboard
-                dashboard.display_dashboard(all_period_data)
+                st.session_state.period_data = dashboard.generate_period_report()
             else:
-                st.sidebar.error("❌ Failed to load data from database")
+                st.error("❌ Failed to load data from database")
     
-    # Instructions
+    # Refresh button
+    if st.sidebar.button("🔄 Refresh Data", type="secondary"):
+        with st.spinner("Refreshing data..."):
+            if dashboard.load_data_from_db():
+                st.session_state.period_data = dashboard.generate_period_report()
+                st.sidebar.success("✅ Data refreshed!")
+            else:
+                st.sidebar.error("❌ Failed to refresh data")
+    
+    st.sidebar.divider()
+    
+    # Data summary
+    if st.session_state.data_loaded:
+        st.sidebar.subheader("📊 Data Summary")
+        if st.session_state.transactions is not None:
+            st.sidebar.metric("Transactions", f"{len(st.session_state.transactions):,}")
+        if st.session_state.onboarding is not None and not st.session_state.onboarding.empty:
+            st.sidebar.metric("Customers", f"{len(st.session_state.onboarding):,}")
+    
     st.sidebar.divider()
     st.sidebar.markdown("### 📖 Instructions")
     st.sidebar.markdown("""
-    1. Click **"Load Data from Database"** to fetch data
-    2. Select a period from the dropdown
-    3. View detailed metrics in expanders
-    4. Analyze trends in the summary tabs
-    
-    ### 📊 Database Info
-    - **Host:** db4free.net
-    - **Database:** bdp_report
-    - **Tables:** Transaction, Onboarding
-    - **Period:** Oct 2025 - Jan 2026
+    1. Data loads automatically on startup
+    2. Use filters in sidebar to refine view
+    3. Select period to view details
+    4. Click expanders for detailed metrics
     """)
     
-    # About section
     st.sidebar.divider()
     st.sidebar.markdown("### ℹ️ About")
     st.sidebar.markdown("""
     **Business Development Performance Dashboard**
     
-    This dashboard analyzes:
-    - Customer acquisition metrics
-    - Product usage patterns
-    - Customer engagement levels
-    - Performance across time periods
-    
-    **Features:**
-    - 7-Day Rolling analysis
-    - Monthly & Weekly periods
-    - Product consistency tracking
-    - Interactive visualizations
+    **Period:** Oct 2025 - Jan 2026
+    **Database:** MySQL
+    **Tables:** Transaction, Onboarding
     """)
     
-    # Show initial message if no data loaded
-    st.title("📊 Business Development Performance Dashboard")
-    st.info("👈 Click **'Load Data from Database'** in the sidebar to start analysis")
-    
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        st.metric("Database", "MySQL", "Ready")
-    with col2:
-        st.metric("Analysis Period", "Oct 2025 - Jan 2026")
-    with col3:
-        st.metric("Data Tables", "2", "Transaction, Onboarding")
+    # Display dashboard if data is loaded
+    if st.session_state.data_loaded and st.session_state.period_data:
+        dashboard.display_dashboard(st.session_state.period_data)
+    else:
+        # Show initial message
+        st.title("📊 Business Development Performance Dashboard")
+        st.info("📥 Loading data... Please wait")
+        
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.metric("Database", "MySQL", "Connecting...")
+        with col2:
+            st.metric("Analysis Period", "Oct 2025 - Jan 2026")
+        with col3:
+            st.metric("Status", "Loading", "⏳")
 
 if __name__ == "__main__":
     main()
