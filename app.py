@@ -85,6 +85,13 @@ st.markdown("""
         border-left: 4px solid #EF4444;
         margin: 1rem 0;
     }
+    .info-box {
+        background-color: #DBEAFE;
+        padding: 1rem;
+        border-radius: 8px;
+        border-left: 4px solid #3B82F6;
+        margin: 1rem 0;
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -154,6 +161,60 @@ class PerformanceReportGenerator:
             st.error(f"❌ Error connecting to MySQL: {str(e)}")
             return None
     
+    def discover_data_ranges(self):
+        """Discover what date ranges have data in the database"""
+        try:
+            connection = self.connect_to_mysql()
+            if connection is None:
+                return {}
+            
+            data_ranges = {}
+            
+            with connection.cursor() as cursor:
+                # Find transaction date range
+                cursor.execute("SELECT MIN(created_at) as min_date, MAX(created_at) as max_date FROM Transaction")
+                trans_range = cursor.fetchone()
+                if trans_range and trans_range['min_date']:
+                    data_ranges['transactions'] = {
+                        'min': trans_range['min_date'],
+                        'max': trans_range['max_date']
+                    }
+                
+                # Find onboarding date range
+                cursor.execute("SELECT MIN(registration_date) as min_date, MAX(registration_date) as max_date FROM Onboarding")
+                onboard_range = cursor.fetchone()
+                if onboard_range and onboard_range['min_date']:
+                    data_ranges['onboarding'] = {
+                        'min': onboard_range['min_date'],
+                        'max': onboard_range['max_date']
+                    }
+                
+                # Get transaction count by month
+                cursor.execute("""
+                    SELECT 
+                        DATE_FORMAT(created_at, '%Y-%m-01') as month,
+                        COUNT(*) as count
+                    FROM Transaction
+                    WHERE created_at >= '2025-10-01'
+                    GROUP BY DATE_FORMAT(created_at, '%Y-%m-01')
+                    ORDER BY month
+                """)
+                monthly_counts = cursor.fetchall()
+                
+                months_with_data = []
+                for row in monthly_counts:
+                    if row['count'] > 0:
+                        months_with_data.append(row['month'])
+                
+                data_ranges['months_with_transactions'] = months_with_data
+            
+            connection.close()
+            return data_ranges
+            
+        except Exception as e:
+            st.warning(f"⚠️ Could not discover data ranges: {str(e)}")
+            return {}
+    
     def test_connection(self):
         """Test database connection and table structure"""
         try:
@@ -165,27 +226,90 @@ class PerformanceReportGenerator:
                 # Test Transaction table
                 cursor.execute("SHOW COLUMNS FROM Transaction")
                 transaction_columns = [col['Field'] for col in cursor.fetchall()]
-                st.info(f"📊 Transaction table columns: {', '.join(transaction_columns[:10])}...")
                 
                 # Test Onboarding table
                 cursor.execute("SHOW COLUMNS FROM Onboarding")
                 onboarding_columns = [col['Field'] for col in cursor.fetchall()]
-                st.info(f"👥 Onboarding table columns: {', '.join(onboarding_columns[:10])}...")
                 
-                # Count records
-                cursor.execute("SELECT COUNT(*) as count FROM Transaction WHERE created_at BETWEEN '2025-12-01' AND '2025-12-31'")
-                trans_count = cursor.fetchone()['count']
+                # Get sample data counts
+                cursor.execute("SELECT COUNT(*) as count FROM Transaction")
+                total_transactions = cursor.fetchone()['count']
                 
-                cursor.execute("SELECT COUNT(*) as count FROM Onboarding WHERE registration_date BETWEEN '2025-12-01' AND '2025-12-31'")
-                onboard_count = cursor.fetchone()['count']
+                cursor.execute("SELECT COUNT(*) as count FROM Onboarding")
+                total_onboarding = cursor.fetchone()['count']
                 
-                st.success(f"✅ Found {trans_count} transactions and {onboard_count} onboarding records for December 2025")
+                # Get date ranges
+                cursor.execute("SELECT MIN(created_at) as min_date, MAX(created_at) as max_date FROM Transaction")
+                trans_dates = cursor.fetchone()
+                
+                cursor.execute("SELECT MIN(registration_date) as min_date, MAX(registration_date) as max_date FROM Onboarding")
+                onboard_dates = cursor.fetchone()
             
             connection.close()
+            
+            # Display connection info
+            st.markdown("""
+            <div class='info-box'>
+            <h4>📊 Database Connection Successful</h4>
+            """, unsafe_allow_html=True)
+            
+            col1, col2 = st.columns(2)
+            with col1:
+                st.metric("Total Transactions", f"{total_transactions:,}")
+                if trans_dates['min_date']:
+                    st.caption(f"Date Range: {trans_dates['min_date'].strftime('%Y-%m-%d')} to {trans_dates['max_date'].strftime('%Y-%m-%d')}")
+            
+            with col2:
+                st.metric("Total Onboarding", f"{total_onboarding:,}")
+                if onboard_dates['min_date']:
+                    st.caption(f"Date Range: {onboard_dates['min_date'].strftime('%Y-%m-%d')} to {onboard_dates['max_date'].strftime('%Y-%m-%d')}")
+            
+            st.markdown("</div>", unsafe_allow_html=True)
+            
             return True
             
         except Exception as e:
             st.error(f"❌ Database test failed: {str(e)}")
+            return False
+    
+    def find_transactions_for_period(self, start_date, end_date):
+        """Try to find transactions near the selected period"""
+        try:
+            connection = self.connect_to_mysql()
+            if connection is None:
+                return False
+            
+            with connection.cursor() as cursor:
+                # Try to find any transactions in a wider range
+                cursor.execute("""
+                    SELECT 
+                        DATE(created_at) as date,
+                        COUNT(*) as count,
+                        SUM(CASE WHEN status = 'SUCCESS' THEN 1 ELSE 0 END) as success_count
+                    FROM Transaction
+                    WHERE created_at BETWEEN %s AND %s
+                    GROUP BY DATE(created_at)
+                    ORDER BY date DESC
+                    LIMIT 10
+                """, (start_date - timedelta(days=30), end_date + timedelta(days=30)))
+                
+                recent_transactions = cursor.fetchall()
+                
+                if recent_transactions:
+                    st.info("📅 Found transactions near your selected period:")
+                    trans_df = pd.DataFrame(recent_transactions)
+                    st.dataframe(trans_df, hide_index=True, use_container_width=True)
+                    
+                    # Suggest better date ranges
+                    dates_with_data = [row['date'] for row in recent_transactions if row['count'] > 0]
+                    if dates_with_data:
+                        st.success(f"✅ Try selecting dates around {min(dates_with_data).strftime('%Y-%m-%d')} to {max(dates_with_data).strftime('%Y-%m-%d')}")
+            
+            connection.close()
+            return len(recent_transactions) > 0
+            
+        except Exception as e:
+            st.warning(f"⚠️ Could not search for transactions: {str(e)}")
             return False
     
     def load_data_from_mysql(self, start_date=None, end_date=None, force_reload=False):
@@ -222,7 +346,7 @@ class PerformanceReportGenerator:
             if connection is None:
                 return False
             
-            # Load transaction data - using correct column names from your sample
+            # Load transaction data
             status_text.text("📥 Loading transaction data from MySQL...")
             progress_bar.progress(20)
             
@@ -236,9 +360,7 @@ class PerformanceReportGenerator:
                     transaction_type, 
                     amount, 
                     ucp_name, 
-                    created_at,
-                    transaction_id,
-                    sub_transaction_id
+                    created_at
                 FROM Transaction
                 WHERE created_at BETWEEN %s AND %s
                 AND status = 'SUCCESS'
@@ -254,10 +376,13 @@ class PerformanceReportGenerator:
                 else:
                     self.transactions = pd.DataFrame()
                     st.warning("⚠️ No transaction records found for selected period")
+                    
+                    # Try to find transactions near this period
+                    self.find_transactions_for_period(start_date, end_date)
             
             progress_bar.progress(50)
             
-            # Load onboarding data - using correct column names from your sample
+            # Load onboarding data
             status_text.text("📥 Loading onboarding data from MySQL...")
             
             onboarding_query = """
@@ -385,8 +510,15 @@ class PerformanceReportGenerator:
                     if 'status' in self.transactions.columns:
                         success_rate = (self.transactions['status'] == 'SUCCESS').mean() * 100
                         st.metric("Success Rate", f"{success_rate:.1f}%")
+                    
+                    # Show transaction date range
+                    if 'created_at' in self.transactions.columns:
+                        min_date = self.transactions['created_at'].min()
+                        max_date = self.transactions['created_at'].max()
+                        st.caption(f"Transactions from {min_date.strftime('%Y-%m-%d')} to {max_date.strftime('%Y-%m-%d')}")
                 else:
-                    st.warning("No transaction data")
+                    st.warning("⚠️ No transaction data for selected period")
+                    st.caption("Try selecting a different date range")
             
             with col2:
                 if len(self.onboarding) > 0:
@@ -397,8 +529,14 @@ class PerformanceReportGenerator:
                     if 'kyc_status' in self.onboarding.columns:
                         verified_users = (self.onboarding['kyc_status'].str.upper() == 'VERIFIED').sum()
                         st.metric("KYC Verified", f"{verified_users:,}")
+                    
+                    # Show onboarding date range
+                    if 'registration_date' in self.onboarding.columns:
+                        min_date = self.onboarding['registration_date'].min()
+                        max_date = self.onboarding['registration_date'].max()
+                        st.caption(f"Registrations from {min_date.strftime('%Y-%m-%d')} to {max_date.strftime('%Y-%m-%d')}")
                 else:
-                    st.warning("No onboarding data")
+                    st.warning("⚠️ No onboarding data for selected period")
     
     def filter_by_date_range(self, df, date_col, start_date, end_date):
         """Filter dataframe by date range"""
@@ -1027,6 +1165,27 @@ def main():
     with st.sidebar:
         st.markdown("### ⚡ Quick Filters")
         
+        # Data discovery button
+        if st.button("🔍 Discover Data Ranges", use_container_width=True):
+            generator = PerformanceReportGenerator()
+            data_ranges = generator.discover_data_ranges()
+            
+            if data_ranges:
+                st.markdown("### 📊 Data Discovery Results")
+                
+                if 'transactions' in data_ranges:
+                    trans = data_ranges['transactions']
+                    st.info(f"**Transactions:** {trans['min'].strftime('%Y-%m-%d')} to {trans['max'].strftime('%Y-%m-%d')}")
+                
+                if 'onboarding' in data_ranges:
+                    onboard = data_ranges['onboarding']
+                    st.info(f"**Onboarding:** {onboard['min'].strftime('%Y-%m-%d')} to {onboard['max'].strftime('%Y-%m-%d')}")
+                
+                if 'months_with_transactions' in data_ranges and data_ranges['months_with_transactions']:
+                    st.success(f"**Months with transactions:** {', '.join(data_ranges['months_with_transactions'])}")
+                else:
+                    st.warning("No transaction data found in any month")
+        
         # Date range selection
         st.markdown("#### 📅 Date Range")
         date_options = {
@@ -1087,6 +1246,21 @@ def main():
         with col2:
             refresh_button = st.button("🔄 Refresh", use_container_width=True)
         
+        # Troubleshooting section
+        st.markdown("---")
+        with st.expander("🛠️ Troubleshooting"):
+            st.markdown("""
+            **Common Issues:**
+            1. **No transaction data**: Try different date ranges
+            2. **Slow loading**: Data is cached for 5 minutes
+            3. **Connection errors**: Check database credentials
+            
+            **Quick Fixes:**
+            - Click "Discover Data Ranges" to find available data
+            - Try "Last 30 Days" or "Full Period" options
+            - Use custom date range for specific dates
+            """)
+        
         # Database info
         st.markdown("---")
         with st.expander("🔒 Connection Info"):
@@ -1140,7 +1314,7 @@ def main():
             generator._display_data_summary()
             
             # Only calculate metrics if we have data
-            if len(generator.transactions) > 0 or len(generator.onboarding) > 0:
+            if len(generator.onboarding) > 0:  # We have onboarding data at least
                 # Calculate metrics
                 with st.spinner("Calculating metrics..."):
                     # Executive Snapshot
@@ -1149,10 +1323,12 @@ def main():
                     # Customer Acquisition
                     cust_acq_metrics = generator.calculate_customer_acquisition(start_date, end_date)
                     
-                    # Product Usage
-                    product_metrics = generator.calculate_product_usage_performance(start_date, end_date, period_type)
+                    # Product Usage (only if we have transactions)
+                    product_metrics = {}
+                    if len(generator.transactions) > 0:
+                        product_metrics = generator.calculate_product_usage_performance(start_date, end_date, period_type)
                     
-                    # Customer Activity
+                    # Customer Activity (only if we have transactions)
                     activity_metrics = generator.calculate_customer_activity_engagement(start_date, end_date, period_type)
                 
                 # Display metrics in tabs
@@ -1190,6 +1366,8 @@ def main():
                                 file_name=f"transactions_{start_date.date()}_to_{end_date.date()}.csv",
                                 mime="text/csv"
                             )
+                        else:
+                            st.info("No transaction data to export")
                     
                     with col2:
                         if not generator.onboarding.empty:
@@ -1211,9 +1389,10 @@ def main():
         
         ### 🚀 Quick Start
         
-        1. **Select Date Range** in the sidebar
-        2. **Choose Period Type** for analysis
-        3. Click **"Load Data"** to begin
+        1. **Click "Discover Data Ranges"** to find available data
+        2. **Select Date Range** based on discovery results
+        3. **Choose Period Type** for analysis
+        4. Click **"Load Data"** to begin
         
         ### 📊 Available Reports
         
@@ -1229,7 +1408,7 @@ def main():
         - **Optimized Queries**: Faster data loading
         - **Smart Filtering**: Real-time updates
         
-        *Ready to begin? Configure your filters and click "Load Data"!*
+        *Ready to begin? Click "Discover Data Ranges" to find your data!*
         """)
         
         # Quick stats
