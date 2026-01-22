@@ -1,5 +1,788 @@
 import streamlit as st
+import pandas as pdimport streamlit as st
 import pandas as pd
+import numpy as np
+from datetime import datetime, timedelta
+import pymysql
+import plotly.graph_objects as go
+import plotly.express as px
+import warnings
+from io import BytesIO
+import base64
+import time
+
+warnings.filterwarnings('ignore')
+
+# Set page configuration
+st.set_page_config(
+    page_title="Business Development Performance Dashboard",
+    page_icon="📊",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
+# Custom CSS
+st.markdown("""
+<style>
+    .main-header {
+        font-size: 2.5rem;
+        color: #1E3A8A;
+        text-align: center;
+        margin-bottom: 1rem;
+    }
+    .sub-header {
+        font-size: 1.5rem;
+        color: #1E3A8A;
+        margin-top: 1.5rem;
+        margin-bottom: 1rem;
+    }
+    .metric-card {
+        background-color: #FFFFFF;
+        padding: 1rem;
+        border-radius: 10px;
+        box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        margin-bottom: 1rem;
+    }
+    .positive {
+        color: #10B981;
+        font-weight: bold;
+    }
+    .negative {
+        color: #EF4444;
+        font-weight: bold;
+    }
+    .neutral {
+        color: #6B7280;
+        font-weight: bold;
+    }
+    .debug-box {
+        background-color: #F3F4F6;
+        padding: 1rem;
+        border-radius: 8px;
+        border-left: 4px solid #6B7280;
+        margin: 1rem 0;
+        font-family: monospace;
+        font-size: 0.9rem;
+    }
+</style>
+""", unsafe_allow_html=True)
+
+# Database configuration (hardcoded)
+DB_CONFIG = {
+    'host': 'db4free.net',
+    'user': 'lamin_d_kinteh',
+    'password': 'Lamin@123',
+    'database': 'bdp_report',
+    'port': 3306
+}
+
+class PerformanceReportGenerator:
+    def __init__(self):
+        # Define all products and their categories
+        self.product_categories = {
+            'P2P (Internal Wallet Transfer)': ['Internal Wallet Transfer'],
+            'Cash-In': ['Deposit'],
+            'Cash-Out': ['Scan To Withdraw Agent', 'Scan To Withdraw Customer', 'OTP Withdrawal'],
+            'Disbursement': ['Disbursement'],
+            'Cash Power': ['Nawec Cashpower'],
+            'E-Ticketing': ['Ticket'],
+            'Bank Transfers': ['BANK_TO_WALLET_TRANSFER', 'WALLET_TO_BANK_TRANSFER']
+        }
+        
+        # Airtime Topup is a Service, not Product
+        self.services = ['Airtime Topup']
+        
+        # Flatten product list for filtering
+        self.all_products = []
+        for category, products in self.product_categories.items():
+            self.all_products.extend(products)
+        
+        # Add service to all products list for reporting
+        self.all_products.append('Airtime Topup')
+        
+        self.transactions = pd.DataFrame()
+        self.onboarding = pd.DataFrame()
+        self.data_cache = {}
+    
+    def connect_to_mysql(self):
+        """Connect to MySQL database"""
+        try:
+            connection = pymysql.connect(
+                host=DB_CONFIG['host'],
+                user=DB_CONFIG['user'],
+                password=DB_CONFIG['password'],
+                database=DB_CONFIG['database'],
+                port=DB_CONFIG.get('port', 3306),
+                charset='utf8mb4',
+                cursorclass=pymysql.cursors.DictCursor,
+                connect_timeout=10
+            )
+            return connection
+        except Exception as e:
+            st.error(f"❌ Error connecting to MySQL: {str(e)}")
+            return None
+    
+    def debug_date_query(self, start_date, end_date):
+        """Debug date query to see what's happening"""
+        try:
+            connection = self.connect_to_mysql()
+            if connection is None:
+                return None
+            
+            with connection.cursor() as cursor:
+                # 1. Check exact date counts
+                cursor.execute("""
+                    SELECT 
+                        DATE(created_at) as date,
+                        COUNT(*) as count
+                    FROM Transaction
+                    WHERE DATE(created_at) BETWEEN %s AND %s
+                    GROUP BY DATE(created_at)
+                    ORDER BY date
+                """, (start_date.date(), end_date.date()))
+                exact_date_counts = cursor.fetchall()
+                
+                # 2. Check date range with timestamps
+                cursor.execute("""
+                    SELECT 
+                        COUNT(*) as count,
+                        MIN(created_at) as min_date,
+                        MAX(created_at) as max_date
+                    FROM Transaction
+                    WHERE created_at BETWEEN %s AND %s
+                """, (start_date, end_date))
+                range_info = cursor.fetchone()
+                
+                # 3. Check what dates actually exist in Nov 1-7
+                cursor.execute("""
+                    SELECT DISTINCT DATE(created_at) as date
+                    FROM Transaction
+                    WHERE created_at BETWEEN '2025-11-01' AND '2025-11-07 23:59:59'
+                    ORDER BY date
+                """)
+                actual_nov_dates = cursor.fetchall()
+                
+                # 4. Get sample of dates around selected period
+                cursor.execute("""
+                    SELECT 
+                        created_at,
+                        DATE(created_at) as date_only,
+                        user_identifier,
+                        product_name,
+                        amount
+                    FROM Transaction
+                    WHERE created_at BETWEEN %s AND %s
+                    ORDER BY created_at
+                    LIMIT 5
+                """, (start_date - timedelta(days=1), end_date + timedelta(days=1)))
+                sample_data = cursor.fetchall()
+            
+            connection.close()
+            
+            return {
+                'exact_date_counts': exact_date_counts,
+                'range_info': range_info,
+                'actual_nov_dates': actual_nov_dates,
+                'sample_data': sample_data
+            }
+            
+        except Exception as e:
+            st.warning(f"⚠️ Debug query failed: {str(e)}")
+            return None
+    
+    def load_data_from_mysql(self, start_date=None, end_date=None, force_reload=False, debug=False):
+        """Load data from MySQL database with debugging"""
+        if start_date is None:
+            start_date = datetime.now() - timedelta(days=7)
+        if end_date is None:
+            end_date = datetime.now()
+        
+        # Create cache key
+        cache_key = f"{start_date.strftime('%Y%m%d')}_{end_date.strftime('%Y%m%d')}"
+        
+        # Check cache if not forcing reload
+        if not force_reload and cache_key in self.data_cache:
+            cache_data = self.data_cache[cache_key]
+            if time.time() - cache_data['timestamp'] < 300:  # 5 minute cache
+                self.transactions = cache_data['transactions']
+                self.onboarding = cache_data['onboarding']
+                st.success(f"✅ Using cached data")
+                return True
+        
+        # Show date range
+        days_diff = (end_date - start_date).days + 1
+        st.markdown(f"**📅 Selected Period:** {start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')} ({days_diff} days)")
+        
+        # Debug mode
+        if debug:
+            debug_info = self.debug_date_query(start_date, end_date)
+            if debug_info:
+                with st.expander("🔍 Date Debug Information", expanded=True):
+                    st.markdown("**1. Exact Date Counts (Nov 1-7):**")
+                    if debug_info['exact_date_counts']:
+                        for row in debug_info['exact_date_counts']:
+                            st.write(f"  {row['date']}: {row['count']:,} transactions")
+                    else:
+                        st.write("  No transactions found for exact dates")
+                    
+                    st.markdown(f"**2. Range Query Results:**")
+                    st.write(f"  Count: {debug_info['range_info']['count']:,}")
+                    st.write(f"  Min Date in range: {debug_info['range_info']['min_date']}")
+                    st.write(f"  Max Date in range: {debug_info['range_info']['max_date']}")
+                    
+                    st.markdown("**3. Actual Dates in Nov 1-7:**")
+                    if debug_info['actual_nov_dates']:
+                        dates = [row['date'].strftime('%Y-%m-%d') for row in debug_info['actual_nov_dates']]
+                        st.write(f"  Found dates: {', '.join(dates)}")
+                    else:
+                        st.write("  No dates found in Nov 1-7")
+                    
+                    if debug_info['sample_data']:
+                        st.markdown("**4. Sample Data Around Period:**")
+                        for row in debug_info['sample_data']:
+                            st.write(f"  {row['created_at']} | {row['date_only']} | User: {row['user_identifier'][:10]}... | {row['product_name']} | {row['amount']}")
+        
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+        
+        try:
+            connection = self.connect_to_mysql()
+            if connection is None:
+                return False
+            
+            # Load transaction data - FIXED QUERY
+            status_text.text("📥 Loading transaction data...")
+            progress_bar.progress(20)
+            
+            # Try different query approaches
+            query_attempts = [
+                # Try exact date match first
+                """
+                SELECT 
+                    user_identifier, 
+                    entity_name, 
+                    status, 
+                    service_name, 
+                    product_name, 
+                    transaction_type, 
+                    amount, 
+                    ucp_name, 
+                    created_at
+                FROM Transaction
+                WHERE DATE(created_at) BETWEEN %s AND %s
+                AND status = 'SUCCESS'
+                """,
+                # Try with full timestamp range
+                """
+                SELECT 
+                    user_identifier, 
+                    entity_name, 
+                    status, 
+                    service_name, 
+                    product_name, 
+                    transaction_type, 
+                    amount, 
+                    ucp_name, 
+                    created_at
+                FROM Transaction
+                WHERE created_at BETWEEN %s AND %s
+                AND status = 'SUCCESS'
+                """,
+                # Try with broader range
+                """
+                SELECT 
+                    user_identifier, 
+                    entity_name, 
+                    status, 
+                    service_name, 
+                    product_name, 
+                    transaction_type, 
+                    amount, 
+                    ucp_name, 
+                    created_at
+                FROM Transaction
+                WHERE created_at BETWEEN DATE_SUB(%s, INTERVAL 1 DAY) AND DATE_ADD(%s, INTERVAL 1 DAY)
+                AND status = 'SUCCESS'
+                """
+            ]
+            
+            transactions_found = False
+            for i, query in enumerate(query_attempts):
+                if not transactions_found:
+                    with connection.cursor() as cursor:
+                        if i == 0:  # DATE() function
+                            cursor.execute(query, (start_date.date(), end_date.date()))
+                        elif i == 1:  # Full timestamp
+                            cursor.execute(query, (start_date, end_date))
+                        else:  # Broader range
+                            cursor.execute(query, (start_date, end_date))
+                        
+                        transaction_results = cursor.fetchall()
+                        
+                        if transaction_results:
+                            self.transactions = pd.DataFrame(transaction_results)
+                            st.success(f"✅ Loaded {len(self.transactions):,} transaction records (using query approach {i+1})")
+                            transactions_found = True
+                            break
+            
+            if not transactions_found:
+                self.transactions = pd.DataFrame()
+                st.warning(f"⚠️ No transactions found for selected period")
+                
+                # Show what dates DO have data
+                with connection.cursor() as cursor:
+                    cursor.execute("""
+                        SELECT DATE(created_at) as date, COUNT(*) as count
+                        FROM Transaction
+                        WHERE created_at BETWEEN '2025-10-01' AND '2025-12-01'
+                        GROUP BY DATE(created_at)
+                        ORDER BY date DESC
+                        LIMIT 10
+                    """)
+                    recent_dates = cursor.fetchall()
+                    
+                    if recent_dates:
+                        st.info("📅 Dates with transaction data:")
+                        dates_info = []
+                        for row in recent_dates:
+                            if row['count'] > 0:
+                                dates_info.append(f"{row['date'].strftime('%Y-%m-%d')} ({row['count']:,})")
+                        
+                        if dates_info:
+                            st.write(", ".join(dates_info))
+                            
+                            # Auto-suggest closest date
+                            for row in recent_dates:
+                                if row['date'] >= start_date.date():
+                                    suggested_start = row['date']
+                                    suggested_end = min(suggested_start + timedelta(days=6), end_date.date())
+                                    st.markdown(f"""
+                                    <div style='background-color: #FEF3C7; padding: 10px; border-radius: 5px; margin: 10px 0;'>
+                                    💡 <b>Try this instead:</b> {suggested_start.strftime('%Y-%m-%d')} to {suggested_end.strftime('%Y-%m-%d')}
+                                    </div>
+                                    """, unsafe_allow_html=True)
+                                    break
+            
+            progress_bar.progress(50)
+            
+            # Load onboarding data
+            status_text.text("📥 Loading onboarding data...")
+            
+            onboarding_query = """
+                SELECT 
+                    account_id,
+                    full_name,
+                    mobile,
+                    email,
+                    region,
+                    district,
+                    town_village,
+                    business_name,
+                    kyc_status,
+                    registration_date,
+                    updated_at,
+                    proof_of_id,
+                    identification_number,
+                    customer_referrer_code,
+                    customer_referrer_mobile,
+                    referrer_entity,
+                    entity,
+                    bank,
+                    bank_account_name,
+                    bank_account_number,
+                    status
+                FROM Onboarding
+                WHERE registration_date BETWEEN %s AND %s
+            """
+            
+            with connection.cursor() as cursor:
+                cursor.execute(onboarding_query, (start_date, end_date))
+                onboarding_results = cursor.fetchall()
+                
+                if onboarding_results:
+                    self.onboarding = pd.DataFrame(onboarding_results)
+                    st.success(f"✅ Loaded {len(self.onboarding):,} onboarding records")
+                else:
+                    self.onboarding = pd.DataFrame()
+                    st.warning("⚠️ No onboarding records found for selected period")
+            
+            progress_bar.progress(80)
+            
+            # Clean and preprocess data
+            status_text.text("🧹 Preprocessing data...")
+            self._preprocess_data()
+            
+            progress_bar.progress(100)
+            status_text.text("✅ Data loading complete!")
+            
+            connection.close()
+            
+            # Cache the data
+            if len(self.transactions) > 0 or len(self.onboarding) > 0:
+                self.data_cache[cache_key] = {
+                    'transactions': self.transactions.copy(),
+                    'onboarding': self.onboarding.copy(),
+                    'timestamp': time.time()
+                }
+            
+            return True
+            
+        except Exception as e:
+            st.error(f"❌ Error loading data: {str(e)}")
+            import traceback
+            st.code(traceback.format_exc())
+            return False
+    
+    def _preprocess_data(self):
+        """Preprocess loaded data"""
+        try:
+            # Parse dates
+            if 'created_at' in self.transactions.columns and len(self.transactions) > 0:
+                self.transactions['created_at'] = pd.to_datetime(self.transactions['created_at'], errors='coerce')
+                # Extract date part for easier filtering
+                self.transactions['created_date'] = self.transactions['created_at'].dt.date
+            
+            if 'registration_date' in self.onboarding.columns and len(self.onboarding) > 0:
+                self.onboarding['registration_date'] = pd.to_datetime(self.onboarding['registration_date'], errors='coerce')
+            
+            # Clean numeric columns
+            if 'amount' in self.transactions.columns and len(self.transactions) > 0:
+                self.transactions['amount'] = pd.to_numeric(self.transactions['amount'], errors='coerce')
+            
+            # Create consistent user identifier
+            if len(self.transactions) > 0:
+                if 'user_identifier' in self.transactions.columns:
+                    self.transactions['user_id'] = self.transactions['user_identifier'].astype(str).str.strip()
+                else:
+                    self.transactions['user_id'] = 'unknown'
+            
+            if len(self.onboarding) > 0:
+                if 'mobile' in self.onboarding.columns:
+                    self.onboarding['user_id'] = self.onboarding['mobile'].astype(str).str.strip()
+                else:
+                    self.onboarding['user_id'] = 'unknown'
+            
+            st.success("✅ Data preprocessing complete")
+            
+        except Exception as e:
+            st.warning(f"⚠️ Some preprocessing issues: {str(e)}")
+    
+    def _display_data_summary(self):
+        """Display data summary"""
+        with st.expander("📊 Data Summary", expanded=True):
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                if len(self.transactions) > 0:
+                    st.metric("Transactions", f"{len(self.transactions):,}")
+                    if 'amount' in self.transactions.columns:
+                        total_amount = self.transactions['amount'].sum()
+                        st.metric("Total Amount", f"GMD {total_amount:,.2f}")
+                    
+                    # Show date range of loaded data
+                    if 'created_at' in self.transactions.columns:
+                        min_date = self.transactions['created_at'].min()
+                        max_date = self.transactions['created_at'].max()
+                        st.caption(f"Transactions from {min_date.strftime('%Y-%m-%d')} to {max_date.strftime('%Y-%m-%d')}")
+                        
+                        # Show unique dates
+                        unique_dates = self.transactions['created_date'].nunique() if 'created_date' in self.transactions.columns else 0
+                        st.caption(f"Covering {unique_dates} unique days")
+                else:
+                    st.warning("⚠️ No transaction data")
+            
+            with col2:
+                if len(self.onboarding) > 0:
+                    st.metric("Onboarding Records", f"{len(self.onboarding):,}")
+                    if 'status' in self.onboarding.columns:
+                        active_users = (self.onboarding['status'] == 'Active').sum()
+                        st.metric("Active Users", f"{active_users:,}")
+                    if 'kyc_status' in self.onboarding.columns:
+                        verified_users = (self.onboarding['kyc_status'].str.upper() == 'VERIFIED').sum()
+                        st.metric("KYC Verified", f"{verified_users:,}")
+                    
+                    if 'registration_date' in self.onboarding.columns:
+                        min_date = self.onboarding['registration_date'].min()
+                        max_date = self.onboarding['registration_date'].max()
+                        st.caption(f"Registrations from {min_date.strftime('%Y-%m-%d')} to {max_date.strftime('%Y-%m-%d')}")
+                else:
+                    st.warning("⚠️ No onboarding data")
+
+def main():
+    """Main Streamlit application"""
+    # Header
+    st.markdown("<h1 class='main-header'>📊 Business Development Performance Dashboard</h1>", unsafe_allow_html=True)
+    st.markdown("---")
+    
+    # Initialize session state
+    if 'data_loaded' not in st.session_state:
+        st.session_state.data_loaded = False
+    if 'debug_mode' not in st.session_state:
+        st.session_state.debug_mode = False
+    
+    # Sidebar for filters
+    with st.sidebar:
+        st.markdown("### ⚡ Quick Filters")
+        
+        # Debug toggle
+        debug_mode = st.checkbox("🔍 Enable Debug Mode", value=st.session_state.debug_mode, 
+                                help="Show detailed query information")
+        
+        # Date range selection
+        st.markdown("#### 📅 Date Range Selection")
+        
+        date_option = st.radio(
+            "Select date range option:",
+            ["Quick Selection", "Custom Range"],
+            index=1,  # Default to Custom Range since that's what you're using
+            key="date_option"
+        )
+        
+        if date_option == "Quick Selection":
+            # Smart options based on known data
+            date_options = {
+                'Late Nov 2025 (Recommended)': (datetime(2025, 11, 24), datetime(2025, 11, 30)),
+                'Full Nov 2025': (datetime(2025, 11, 1), datetime(2025, 11, 30)),
+                'Last Week of Data': (datetime(2025, 11, 23), datetime(2025, 11, 29)),
+                'Mid Nov 2025': (datetime(2025, 11, 15), datetime(2025, 11, 21)),
+            }
+            
+            selected_period = st.selectbox(
+                "Select Period",
+                list(date_options.keys()),
+                key="period_selector"
+            )
+            
+            start_date, end_date = date_options[selected_period]
+            
+            st.info(f"✅ Selected: {selected_period}")
+            st.caption(f"Dates: {start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}")
+        
+        else:  # Custom Range
+            selected_period = "Custom Range"
+            
+            col1, col2 = st.columns(2)
+            with col1:
+                start_date = st.date_input(
+                    "Start Date", 
+                    datetime(2025, 11, 24),  # Default to date we know has data
+                    key="custom_start_date"
+                )
+            with col2:
+                end_date = st.date_input(
+                    "End Date", 
+                    datetime(2025, 11, 30),  # Default to date we know has data
+                    key="custom_end_date"
+                )
+            start_date = datetime.combine(start_date, datetime.min.time())
+            end_date = datetime.combine(end_date, datetime.max.time())
+            
+            # Show info
+            days_diff = (end_date - start_date).days + 1
+            st.info(f"✅ Custom Range Selected ({days_diff} days)")
+        
+        # Quick date buttons
+        st.markdown("#### ⚡ Quick Date Buttons")
+        col1, col2, col3 = st.columns(3)
+        
+        with col1:
+            if st.button("Nov 24-30", use_container_width=True):
+                st.session_state.custom_start_date = datetime(2025, 11, 24).date()
+                st.session_state.custom_end_date = datetime(2025, 11, 30).date()
+                st.rerun()
+        
+        with col2:
+            if st.button("Nov 20-26", use_container_width=True):
+                st.session_state.custom_start_date = datetime(2025, 11, 20).date()
+                st.session_state.custom_end_date = datetime(2025, 11, 26).date()
+                st.rerun()
+        
+        with col3:
+            if st.button("Last 7 Days", use_container_width=True):
+                st.session_state.custom_start_date = (datetime.now() - timedelta(days=6)).date()
+                st.session_state.custom_end_date = datetime.now().date()
+                st.rerun()
+        
+        # Period type
+        st.markdown("#### ⏰ Period Type")
+        period_type = st.selectbox(
+            "Select Analysis Period Type",
+            ['Weekly', 'Monthly', '7-Day Rolling'],
+            index=0,
+            key="period_type_selector"
+        ).lower()
+        
+        # Action buttons
+        st.markdown("---")
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            load_button = st.button("🚀 Load Data", type="primary", use_container_width=True)
+        
+        with col2:
+            refresh_button = st.button("🔄 Refresh", use_container_width=True)
+    
+    # Main content
+    if load_button or refresh_button or st.session_state.data_loaded:
+        # Update debug mode
+        st.session_state.debug_mode = debug_mode
+        
+        # Initialize generator
+        generator = PerformanceReportGenerator()
+        
+        # Load data with debug mode
+        success = generator.load_data_from_mysql(start_date, end_date, force_reload=refresh_button, debug=debug_mode)
+        
+        if success:
+            st.session_state.data_loaded = True
+            
+            # Display data summary
+            generator._display_data_summary()
+            
+            # Show sample data if debug mode
+            if debug_mode and len(generator.transactions) > 0:
+                with st.expander("📋 Sample Transaction Data", expanded=False):
+                    st.write(f"Total rows: {len(generator.transactions)}")
+                    st.write(f"Columns: {', '.join(generator.transactions.columns.tolist())}")
+                    
+                    # Show first few rows
+                    if len(generator.transactions) > 0:
+                        st.dataframe(generator.transactions.head(10))
+                        
+                        # Show date distribution
+                        if 'created_date' in generator.transactions.columns:
+                            date_counts = generator.transactions['created_date'].value_counts().sort_index()
+                            st.write("**Date Distribution:**")
+                            for date, count in date_counts.items():
+                                st.write(f"  {date}: {count:,}")
+            
+            # Only proceed if we have data
+            if len(generator.transactions) > 0 or len(generator.onboarding) > 0:
+                # Simple metrics display
+                st.markdown("### 📈 Key Metrics")
+                
+                if len(generator.transactions) > 0:
+                    col1, col2, col3, col4 = st.columns(4)
+                    
+                    with col1:
+                        st.metric("Total Transactions", f"{len(generator.transactions):,}")
+                    
+                    with col2:
+                        unique_users = generator.transactions['user_id'].nunique() if 'user_id' in generator.transactions.columns else 0
+                        st.metric("Unique Users", f"{unique_users:,}")
+                    
+                    with col3:
+                        if 'amount' in generator.transactions.columns:
+                            total_amount = generator.transactions['amount'].sum()
+                            st.metric("Total Amount", f"GMD {total_amount:,.2f}")
+                    
+                    with col4:
+                        if 'product_name' in generator.transactions.columns:
+                            top_product = generator.transactions['product_name'].mode()[0] if len(generator.transactions['product_name'].mode()) > 0 else "N/A"
+                            st.metric("Most Common Product", top_product)
+                
+                if len(generator.onboarding) > 0:
+                    st.markdown("### 👥 Onboarding Summary")
+                    col1, col2, col3 = st.columns(3)
+                    
+                    with col1:
+                        st.metric("Total Registrations", f"{len(generator.onboarding):,}")
+                    
+                    with col2:
+                        if 'status' in generator.onboarding.columns:
+                            active_count = (generator.onboarding['status'] == 'Active').sum()
+                            st.metric("Active Users", f"{active_count:,}")
+                    
+                    with col3:
+                        if 'kyc_status' in generator.onboarding.columns:
+                            verified_count = (generator.onboarding['kyc_status'].str.upper() == 'VERIFIED').sum()
+                            st.metric("KYC Verified", f"{verified_count:,}")
+                
+                # Export options
+                st.markdown("### 📥 Export Data")
+                col1, col2 = st.columns(2)
+                
+                with col1:
+                    if len(generator.transactions) > 0:
+                        csv = generator.transactions.to_csv(index=False)
+                        st.download_button(
+                            label="📥 Download Transactions CSV",
+                            data=csv,
+                            file_name=f"transactions_{start_date.date()}_to_{end_date.date()}.csv",
+                            mime="text/csv",
+                            use_container_width=True
+                        )
+                
+                with col2:
+                    if len(generator.onboarding) > 0:
+                        csv = generator.onboarding.to_csv(index=False)
+                        st.download_button(
+                            label="📥 Download Onboarding CSV",
+                            data=csv,
+                            file_name=f"onboarding_{start_date.date()}_to_{end_date.date()}.csv",
+                            mime="text/csv",
+                            use_container_width=True
+                        )
+            else:
+                st.error("❌ No data loaded. Please try different dates.")
+                
+                # Suggest specific dates that should work
+                st.markdown("""
+                ### 💡 Try These Dates Instead:
+                
+                Based on your database, these dates have transaction data:
+                
+                **🎯 Recommended:** 
+                - **Nov 24-30, 2025** (busiest period with 7,000+ transactions/day)
+                - **Nov 20-26, 2025** (good coverage)
+                
+                **📅 How to select:**
+                1. Click **"Nov 24-30"** button in sidebar
+                2. OR Select **"Late Nov 2025 (Recommended)"** in Quick Selection
+                3. Click **"Load Data"** again
+                """)
+        else:
+            st.error("❌ Failed to load data.")
+    else:
+        # Welcome message
+        st.markdown("""
+        ## Welcome to the Business Development Performance Dashboard!
+        
+        ### 🎯 Important Notice About Your Data
+        
+        Your database analysis shows:
+        - **✅ 763,289 transactions** available
+        - **📅 Data exists from:** Oct 13, 2025 to Nov 30, 2025
+        - **⚠️ Issue:** Nov 1-7, 2025 has little to no transaction data
+        - **🎯 Busiest period:** Nov 24-30, 2025 (7,000+ transactions/day)
+        
+        ### 🚀 Quick Start
+        
+        1. **Click "Nov 24-30"** button in sidebar (recommended)
+        2. **OR Select "Late Nov 2025 (Recommended)"** in Quick Selection
+        3. **Click "Load Data"** to see actual transaction data
+        
+        ### 🔧 Troubleshooting
+        
+        If you're not seeing data:
+        - Enable **"Debug Mode"** in sidebar for detailed information
+        - Try the **recommended dates** above
+        - Check that dates are within **Oct 13 - Nov 30, 2025**
+        
+        *Ready to see your data? Click "Nov 24-30" and then "Load Data"!*
+        """)
+        
+        # Quick stats
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.metric("Total Transactions", "763,289")
+        with col2:
+            st.metric("Data Range", "49 days")
+        with col3:
+            st.metric("Peak Day", "Nov 26")
+
+if __name__ == "__main__":
+    main()
 import numpy as np
 from datetime import datetime, timedelta
 import pymysql
