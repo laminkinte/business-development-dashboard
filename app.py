@@ -2,7 +2,7 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
-from sqlalchemy import create_engine, text
+import pymysql
 import plotly.graph_objects as go
 import plotly.express as px
 import warnings
@@ -18,40 +18,50 @@ st.set_page_config(
 
 class DatabaseManager:
     def __init__(self):
-        self.engine = None
+        self.connection = None
         
     def connect(self):
-        """Connect to MySQL database using SQLAlchemy"""
+        """Connect to MySQL database"""
         try:
-            # Create connection string for pymysql
-            connection_string = f"mysql+pymysql://lamin_d_kinteh:Lamin@123@db4free.net:3306/bdp_report"
-            self.engine = create_engine(connection_string)
+            self.connection = pymysql.connect(
+                host='db4free.net',
+                database='bdp_report',
+                user='lamin_d_kinteh',
+                password='Lamin@123',
+                port=3306,
+                charset='utf8mb4',
+                cursorclass=pymysql.cursors.DictCursor,
+                connect_timeout=10
+            )
             return True
         except Exception as e:
-            st.error(f"Error connecting to MySQL database: {e}")
+            st.error(f"❌ Error connecting to MySQL database: {str(e)}")
             return False
     
     def disconnect(self):
         """Disconnect from database"""
-        if self.engine:
-            self.engine.dispose()
+        if self.connection:
+            self.connection.close()
     
     def execute_query(self, query, params=None):
         """Execute SQL query and return DataFrame"""
         try:
-            with self.engine.connect() as connection:
+            with self.connection.cursor() as cursor:
                 if params:
-                    result = connection.execute(text(query), params)
+                    cursor.execute(query, params)
                 else:
-                    result = connection.execute(text(query))
+                    cursor.execute(query)
                 
-                # Convert to DataFrame
-                df = pd.DataFrame(result.fetchall())
-                if not df.empty:
-                    df.columns = result.keys()
-                return df
+                result = cursor.fetchall()
+                
+                if result:
+                    # Get column names from cursor description
+                    columns = [desc[0] for desc in cursor.description]
+                    return pd.DataFrame(result, columns=columns)
+                else:
+                    return pd.DataFrame()
         except Exception as e:
-            st.error(f"Error executing query: {e}")
+            st.error(f"Error executing query: {str(e)}")
             return pd.DataFrame()
 
 class PerformanceDashboard:
@@ -1123,19 +1133,24 @@ def main():
     - Interactive visualizations
     """)
     
-    # Show initial message if no data loaded
-    if 'transactions' not in locals():
+     # Show initial message if no data loaded
+    if 'dashboard' in locals():
+        if not hasattr(dashboard, 'transactions'):
+            st.title("📊 Business Development Performance Dashboard")
+            st.info("👈 Click **'Load Data from Database'** in the sidebar to start analysis")
+            
+            # Show sample metrics
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.metric("Database", "MySQL", "Ready")
+            with col2:
+                st.metric("Analysis Period", "Oct 2025 - Jan 2026")
+            with col3:
+                st.metric("Data Tables", "2", "Transaction, Onboarding")
+    else:
         st.title("📊 Business Development Performance Dashboard")
         st.info("👈 Click **'Load Data from Database'** in the sidebar to start analysis")
-        
-        # Show sample metrics
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            st.metric("Database", "MySQL", "Connected")
-        with col2:
-            st.metric("Analysis Period", "Oct 2025 - Jan 2026")
-        with col3:
-            st.metric("Data Tables", "2", "Transaction, Onboarding")
 
 if __name__ == "__main__":
+    main()
     main()
