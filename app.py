@@ -109,8 +109,8 @@ class PerformanceReportGenerator:
             'database': 'bdp_report',
             'port': 3306
         }
-        self.transactions = pd.DataFrame()
-        self.onboarding = pd.DataFrame()
+        self.Transaction = pd.DataFrame()
+        self.Onboarding = pd.DataFrame()
         
         st.info(f"Report Period: {self.start_date_overall.strftime('%Y-%m-%d')} to {self.end_date_overall.strftime('%Y-%m-%d')}")
     
