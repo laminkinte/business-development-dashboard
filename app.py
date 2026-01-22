@@ -59,6 +59,9 @@ st.markdown("""
         border-radius: 10px;
         margin-bottom: 1rem;
     }
+    .stButton > button {
+        width: 100%;
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -98,8 +101,14 @@ class PerformanceReportGenerator:
         # Track product performance history for consistency analysis
         self.product_performance_history = {}
         
-        # Database configuration
-        self.db_config = db_config
+        # Database configuration - Using your provided credentials
+        self.db_config = db_config or {
+            'host': 'db4free.net',
+            'user': 'lamin_d_kinteh',
+            'password': 'Lamin@123',
+            'database': 'bdp_report',
+            'port': 3306
+        }
         self.transactions = pd.DataFrame()
         self.onboarding = pd.DataFrame()
         
@@ -115,9 +124,14 @@ class PerformanceReportGenerator:
                 database=self.db_config['database'],
                 port=self.db_config.get('port', 3306),
                 charset='utf8mb4',
-                cursorclass=pymysql.cursors.DictCursor
+                cursorclass=pymysql.cursors.DictCursor,
+                connect_timeout=10
             )
             return connection
+        except pymysql.err.OperationalError as e:
+            st.error(f"Database connection error: {e}")
+            st.info("Please check: 1) Internet connection 2) Database credentials 3) Database is running")
+            return None
         except Exception as e:
             st.error(f"Error connecting to MySQL: {e}")
             return None
@@ -133,6 +147,9 @@ class PerformanceReportGenerator:
         status_text = st.empty()
         
         try:
+            status_text.text("Connecting to database...")
+            progress_bar.progress(10)
+            
             connection = self.connect_to_mysql()
             if connection is None:
                 return False
@@ -153,6 +170,8 @@ class PerformanceReportGenerator:
                     parent_user_identifier, parent_full_name
                 FROM transactions
                 WHERE created_at BETWEEN %s AND %s
+                AND created_at IS NOT NULL
+                ORDER BY created_at
             """
             
             with connection.cursor() as cursor:
@@ -160,7 +179,11 @@ class PerformanceReportGenerator:
                 transaction_results = cursor.fetchall()
                 self.transactions = pd.DataFrame(transaction_results)
             
-            st.success(f"✓ Loaded {len(self.transactions)} transaction records")
+            if len(self.transactions) == 0:
+                st.warning("⚠️ No transaction data found for the selected period")
+            else:
+                st.success(f"✓ Loaded {len(self.transactions)} transaction records")
+            
             progress_bar.progress(60)
             
             # Load onboarding data
@@ -176,6 +199,8 @@ class PerformanceReportGenerator:
                     bank_account_number, status
                 FROM onboarding
                 WHERE registration_date BETWEEN %s AND %s
+                AND registration_date IS NOT NULL
+                ORDER BY registration_date
             """
             
             with connection.cursor() as cursor:
@@ -183,7 +208,11 @@ class PerformanceReportGenerator:
                 onboarding_results = cursor.fetchall()
                 self.onboarding = pd.DataFrame(onboarding_results)
             
-            st.success(f"✓ Loaded {len(self.onboarding)} onboarding records")
+            if len(self.onboarding) == 0:
+                st.warning("⚠️ No onboarding data found for the selected period")
+            else:
+                st.success(f"✓ Loaded {len(self.onboarding)} onboarding records")
+            
             progress_bar.progress(90)
             
             # Clean and preprocess data
@@ -201,54 +230,79 @@ class PerformanceReportGenerator:
             return True
             
         except Exception as e:
-            st.error(f"Error loading data from MySQL: {e}")
+            st.error(f"Error loading data from MySQL: {str(e)}")
+            import traceback
+            st.code(traceback.format_exc())
             return False
     
     def _preprocess_data(self):
         """Preprocess loaded data"""
+        if self.transactions.empty and self.onboarding.empty:
+            return
+        
         # Clean column names
-        self.transactions.columns = self.transactions.columns.str.strip()
-        self.onboarding.columns = self.onboarding.columns.str.strip()
+        if not self.transactions.empty:
+            self.transactions.columns = self.transactions.columns.str.strip()
+        
+        if not self.onboarding.empty:
+            self.onboarding.columns = self.onboarding.columns.str.strip()
         
         # Parse dates
-        if 'created_at' in self.transactions.columns:
-            self.transactions['created_at'] = pd.to_datetime(self.transactions['created_at'])
+        if not self.transactions.empty and 'created_at' in self.transactions.columns:
+            self.transactions['created_at'] = pd.to_datetime(self.transactions['created_at'], errors='coerce')
         
-        if 'registration_date' in self.onboarding.columns:
-            self.onboarding['registration_date'] = pd.to_datetime(self.onboarding['registration_date'])
+        if not self.onboarding.empty and 'registration_date' in self.onboarding.columns:
+            self.onboarding['registration_date'] = pd.to_datetime(self.onboarding['registration_date'], errors='coerce')
         
         # Clean numeric columns
-        if 'amount' in self.transactions.columns:
+        if not self.transactions.empty and 'amount' in self.transactions.columns:
             self.transactions['amount'] = pd.to_numeric(self.transactions['amount'], errors='coerce')
         
         # Create User Identifier for merging
-        if 'mobile' in self.onboarding.columns:
+        if not self.onboarding.empty and 'mobile' in self.onboarding.columns:
             self.onboarding['user_identifier'] = self.onboarding['mobile'].astype(str).str.strip()
         
-        # Clean text columns
-        text_columns = ['user_identifier', 'product_name', 'entity_name', 'transaction_type', 
-                       'ucp_name', 'service_name', 'status', 'sub_transaction_id']
-        for col in text_columns:
-            if col in self.transactions.columns:
-                self.transactions[col] = self.transactions[col].astype(str).str.strip()
+        # Clean text columns in transactions
+        if not self.transactions.empty:
+            text_columns = ['user_identifier', 'product_name', 'entity_name', 'transaction_type', 
+                           'ucp_name', 'service_name', 'status', 'sub_transaction_id']
+            for col in text_columns:
+                if col in self.transactions.columns:
+                    self.transactions[col] = self.transactions[col].astype(str).str.strip()
     
     def _display_data_quality(self):
         """Display data quality metrics"""
-        with st.expander("Data Quality Summary", expanded=False):
+        with st.expander("📊 Data Quality Summary", expanded=False):
             col1, col2 = st.columns(2)
             
             with col1:
-                st.metric("Transactions", f"{len(self.transactions):,}")
-                st.metric("Onboarding Records", f"{len(self.onboarding):,}")
+                if not self.transactions.empty:
+                    st.metric("Transactions", f"{len(self.transactions):,}")
+                    if 'status' in self.transactions.columns:
+                        success_rate = (self.transactions['status'] == 'SUCCESS').mean() * 100
+                        st.metric("Success Rate", f"{success_rate:.1f}%")
+                else:
+                    st.metric("Transactions", "0")
+                    st.metric("Success Rate", "0%")
             
             with col2:
-                if 'status' in self.transactions.columns:
-                    success_rate = (self.transactions['status'] == 'SUCCESS').mean() * 100
-                    st.metric("Transaction Success Rate", f"{success_rate:.1f}%")
-                
-                if 'status' in self.onboarding.columns:
-                    active_users = (self.onboarding['status'] == 'Active').sum()
-                    st.metric("Active Users", f"{active_users:,}")
+                if not self.onboarding.empty:
+                    st.metric("Onboarding Records", f"{len(self.onboarding):,}")
+                    if 'status' in self.onboarding.columns:
+                        active_users = (self.onboarding['status'] == 'Active').sum()
+                        st.metric("Active Users", f"{active_users:,}")
+                else:
+                    st.metric("Onboarding Records", "0")
+                    st.metric("Active Users", "0")
+            
+            # Show sample data
+            if not self.transactions.empty:
+                st.markdown("**Sample Transaction Data:**")
+                st.dataframe(self.transactions.head(3), use_container_width=True)
+            
+            if not self.onboarding.empty:
+                st.markdown("**Sample Onboarding Data:**")
+                st.dataframe(self.onboarding.head(3), use_container_width=True)
     
     def get_date_filter_options(self):
         """Get date filter options for Streamlit"""
@@ -267,7 +321,7 @@ class PerformanceReportGenerator:
     
     def filter_by_date_range(self, df, date_col, start_date, end_date):
         """Filter dataframe by date range"""
-        if date_col not in df.columns:
+        if df.empty or date_col not in df.columns:
             return pd.DataFrame()
         
         valid_dates = df[date_col].notna()
@@ -276,6 +330,9 @@ class PerformanceReportGenerator:
     
     def get_new_registered_customers_segmented(self, start_date, end_date):
         """Get new registered customers segmented by Status"""
+        if self.onboarding.empty:
+            return {'Active': 0, 'Registered': 0, 'TemporaryRegister': 0, 'Total': 0}, {'Active': [], 'Registered': [], 'TemporaryRegister': [], 'Total': []}
+        
         period_onboarding = self.filter_by_date_range(
             self.onboarding, 'registration_date', start_date, end_date
         )
@@ -305,6 +362,9 @@ class PerformanceReportGenerator:
     
     def get_active_customers_all(self, start_date, end_date, period_type):
         """Get ALL active customers (not just new ones) based on period type"""
+        if self.transactions.empty:
+            return [], 0
+        
         period_transactions = self.filter_by_date_range(
             self.transactions, 'created_at', start_date, end_date
         )
@@ -584,6 +644,9 @@ class PerformanceReportGenerator:
     
     def calculate_product_usage_performance(self, start_date, end_date, period_type, previous_start=None, previous_end=None):
         """Calculate Product Usage Performance metrics"""
+        if self.transactions.empty:
+            return {}
+        
         period_transactions = self.filter_by_date_range(
             self.transactions, 'created_at', start_date, end_date
         )
@@ -750,6 +813,17 @@ class PerformanceReportGenerator:
     
     def calculate_customer_activity_engagement(self, start_date, end_date, period_type):
         """Calculate Customer Activity & Engagement metrics"""
+        if self.transactions.empty:
+            return {
+                'wau': 0,
+                'avg_transactions_per_user': 0,
+                'avg_products_per_user': 0,
+                'dormant_users': 0,
+                'reactivated_users': 0,
+                'total_transactions': 0,
+                'period_type': period_type
+            }
+        
         period_transactions = self.filter_by_date_range(
             self.transactions, 'created_at', start_date, end_date
         )
@@ -817,7 +891,7 @@ class PerformanceReportGenerator:
 
 def display_executive_snapshot(metrics, period_name):
     """Display Executive Snapshot metrics"""
-    st.markdown(f"<h3 class='sub-header'>{period_name}</h3>", unsafe_allow_html=True)
+    st.markdown(f"<h3 class='sub-header'>{period_name} - Executive Snapshot</h3>", unsafe_allow_html=True)
     
     col1, col2, col3, col4 = st.columns(4)
     
@@ -840,10 +914,11 @@ def display_executive_snapshot(metrics, period_name):
     with col4:
         if metrics.get('low_product') != 'N/A':
             st.metric("Lowest Product", metrics.get('low_product', 'N/A'))
-            st.metric("Top Product Usage", metrics.get('top_product_count', 0))
+            if metrics.get('top_product_count', 0) > 0:
+                st.metric("Top Product Usage", metrics.get('top_product_count', 0))
     
     # Display segmented metrics
-    with st.expander("Detailed Customer Segmentation", expanded=False):
+    with st.expander("📋 Detailed Customer Segmentation", expanded=False):
         seg_col1, seg_col2, seg_col3, seg_col4 = st.columns(4)
         
         with seg_col1:
@@ -864,15 +939,20 @@ def display_executive_snapshot(metrics, period_name):
 
 def display_customer_acquisition(metrics):
     """Display Customer Acquisition metrics"""
-    st.markdown("<h3 class='sub-header'>Customer Acquisition</h3>", unsafe_allow_html=True)
+    st.markdown("<h3 class='sub-header'>👥 Customer Acquisition</h3>", unsafe_allow_html=True)
     
     col1, col2, col3, col4 = st.columns(4)
     
     with col1:
         st.metric("New Registrations", metrics.get('new_registrations_total', 0))
+        st.caption(f"Active: {metrics.get('new_registrations_active', 0)}")
     
     with col2:
         st.metric("KYC Completed", metrics.get('kyc_completed', 0))
+        if 'comparison' in metrics and 'kyc_completed' in metrics['comparison']:
+            comp = metrics['comparison']['kyc_completed']
+            delta = f"{comp['growth']:.1f}%" if comp['growth'] is not None else None
+            st.metric("vs Previous", comp['current'], delta=delta)
     
     with col3:
         ftt = metrics.get('ftt', 0)
@@ -888,7 +968,11 @@ def display_customer_acquisition(metrics):
 
 def display_product_usage(product_metrics):
     """Display Product Usage Performance"""
-    st.markdown("<h3 class='sub-header'>Product Usage Performance</h3>", unsafe_allow_html=True)
+    st.markdown("<h3 class='sub-header'>📊 Product Usage Performance</h3>", unsafe_allow_html=True)
+    
+    if not product_metrics:
+        st.info("No product usage data available for this period.")
+        return
     
     # Create dataframe for display
     product_data = []
@@ -908,9 +992,9 @@ def display_product_usage(product_metrics):
         df = pd.DataFrame(product_data)
         df = df.sort_values('Transactions', ascending=False)
         
-        # Display top 10 products
+        # Display all products
         st.dataframe(
-            df.head(10),
+            df,
             use_container_width=True,
             hide_index=True,
             column_config={
@@ -931,36 +1015,38 @@ def display_product_usage(product_metrics):
         with col1:
             # Top products by transactions
             top_products = df.head(10).sort_values('Transactions')
-            fig = px.bar(
-                top_products,
-                y='Product',
-                x='Transactions',
-                title='Top 10 Products by Transactions',
-                orientation='h',
-                color='Transactions',
-                color_continuous_scale='Blues'
-            )
-            fig.update_layout(height=400)
-            st.plotly_chart(fig, use_container_width=True)
+            if not top_products.empty:
+                fig = px.bar(
+                    top_products,
+                    y='Product',
+                    x='Transactions',
+                    title='Top Products by Transactions',
+                    orientation='h',
+                    color='Transactions',
+                    color_continuous_scale='Blues'
+                )
+                fig.update_layout(height=400)
+                st.plotly_chart(fig, use_container_width=True)
         
         with col2:
             # Product categories by active users
             category_data = df.groupby('Category')['Active Users'].sum().reset_index()
-            fig = px.pie(
-                category_data,
-                values='Active Users',
-                names='Category',
-                title='Active Users by Product Category',
-                hole=0.4
-            )
-            fig.update_layout(height=400)
-            st.plotly_chart(fig, use_container_width=True)
+            if not category_data.empty:
+                fig = px.pie(
+                    category_data,
+                    values='Active Users',
+                    names='Category',
+                    title='Active Users by Product Category',
+                    hole=0.4
+                )
+                fig.update_layout(height=400)
+                st.plotly_chart(fig, use_container_width=True)
     else:
         st.info("No product usage data available for this period.")
 
 def display_customer_activity(metrics):
     """Display Customer Activity metrics"""
-    st.markdown("<h3 class='sub-header'>Customer Activity & Engagement</h3>", unsafe_allow_html=True)
+    st.markdown("<h3 class='sub-header'>📱 Customer Activity & Engagement</h3>", unsafe_allow_html=True)
     
     col1, col2, col3, col4 = st.columns(4)
     
@@ -976,6 +1062,13 @@ def display_customer_activity(metrics):
     with col4:
         st.metric("Avg Products/User", f"{metrics.get('avg_products_per_user', 0):.2f}")
 
+def create_download_link(df, filename):
+    """Create a download link for a dataframe"""
+    csv = df.to_csv(index=False)
+    b64 = base64.b64encode(csv.encode()).decode()
+    href = f'<a href="data:file/csv;base64,{b64}" download="{filename}">📥 Download {filename}</a>'
+    return href
+
 def main():
     """Main Streamlit application"""
     # Header
@@ -986,21 +1079,18 @@ def main():
     with st.sidebar:
         st.markdown("### 🔧 Configuration")
         
-        # Database configuration
+        # Database configuration with your credentials
         st.markdown("#### Database Connection")
-        db_host = st.text_input("MySQL Host", "localhost")
-        db_user = st.text_input("MySQL User", "root")
-        db_password = st.text_input("MySQL Password", type="password")
-        db_name = st.text_input("Database Name", "your_database")
-        db_port = st.number_input("MySQL Port", value=3306, min_value=1, max_value=65535)
+        st.info("Using pre-configured database: db4free.net")
         
-        db_config = {
-            'host': db_host,
-            'user': db_user,
-            'password': db_password,
-            'database': db_name,
-            'port': db_port
-        }
+        # Show credentials (read-only)
+        col1, col2 = st.columns(2)
+        with col1:
+            st.text_input("Host", "db4free.net", disabled=True)
+            st.text_input("Database", "bdp_report", disabled=True)
+        with col2:
+            st.text_input("User", "lamin_d_kinteh", disabled=True)
+            st.text_input("Port", "3306", disabled=True)
         
         # Date range selection
         st.markdown("#### 📅 Date Range")
@@ -1013,7 +1103,8 @@ def main():
             'January 2026 Week 1': (datetime(2026, 1, 1), datetime(2026, 1, 7)),
             'January 2026 Week 2': (datetime(2026, 1, 8), min(datetime(2026, 1, 14), datetime.now())),
             'Last 7 Days': (datetime.now() - timedelta(days=7), datetime.now()),
-            'Last 30 Days': (datetime.now() - timedelta(days=30), datetime.now())
+            'Last 30 Days': (datetime.now() - timedelta(days=30), datetime.now()),
+            'Custom Range': 'custom'
         }
         
         selected_period = st.selectbox(
@@ -1045,6 +1136,12 @@ def main():
         st.markdown("---")
         load_data = st.button("🚀 Load Data & Generate Report", type="primary", use_container_width=True)
         
+        # Quick refresh button
+        if st.session_state.get('data_loaded', False):
+            if st.button("🔄 Refresh Data", use_container_width=True):
+                st.session_state.data_loaded = False
+                st.rerun()
+        
         # Info section
         st.markdown("---")
         with st.expander("ℹ️ About this Dashboard"):
@@ -1056,24 +1153,36 @@ def main():
             - Customer activity metrics
             - Interactive visualizations
             
-            **Data Sources:**
-            - MySQL transactions table
-            - MySQL onboarding table
+            **Current Database:**
+            - Host: db4free.net
+            - Database: bdp_report
+            - User: lamin_d_kinteh
             
             **Period Types:**
             - **Monthly**: ≥10 transactions for active status
             - **Weekly/Rolling**: ≥2 transactions for active status
             """)
     
-    # Initialize report generator
+    # Initialize report generator with your credentials
+    db_config = {
+        'host': 'db4free.net',
+        'user': 'lamin_d_kinteh',
+        'password': 'Lamin@123',
+        'database': 'bdp_report',
+        'port': 3306
+    }
+    
     generator = PerformanceReportGenerator(db_config)
     
     # Main content area
-    if load_data:
+    if load_data or st.session_state.get('data_loaded', False):
+        if load_data:
+            st.session_state.data_loaded = True
+        
         with st.spinner("Loading data from MySQL..."):
             success = generator.load_data_from_mysql(start_date, end_date)
         
-        if success:
+        if success and (not generator.transactions.empty or not generator.onboarding.empty):
             # Calculate metrics
             with st.spinner("Calculating metrics..."):
                 # Executive Snapshot
@@ -1110,7 +1219,7 @@ def main():
                 display_customer_activity(activity_metrics)
             
             with tab5:
-                st.markdown("<h3 class='sub-header'>Export Data</h3>", unsafe_allow_html=True)
+                st.markdown("<h3 class='sub-header'>📥 Export Data</h3>", unsafe_allow_html=True)
                 
                 col1, col2 = st.columns(2)
                 
@@ -1125,6 +1234,8 @@ def main():
                             mime="text/csv",
                             use_container_width=True
                         )
+                    else:
+                        st.warning("No transaction data to export")
                 
                 with col2:
                     # Export onboarding
@@ -1137,6 +1248,8 @@ def main():
                             mime="text/csv",
                             use_container_width=True
                         )
+                    else:
+                        st.warning("No onboarding data to export")
                 
                 # Export summary report
                 st.markdown("---")
@@ -1185,8 +1298,28 @@ def main():
                     mime="text/csv",
                     use_container_width=True
                 )
+                
+                # Show SQL queries
+                with st.expander("🔍 View SQL Queries", expanded=False):
+                    st.code(f"""
+                    -- Transactions Query
+                    SELECT * FROM transactions 
+                    WHERE created_at BETWEEN '{start_date}' AND '{end_date}'
+                    ORDER BY created_at;
+                    
+                    -- Onboarding Query  
+                    SELECT * FROM onboarding
+                    WHERE registration_date BETWEEN '{start_date}' AND '{end_date}'
+                    ORDER BY registration_date;
+                    """, language="sql")
         else:
-            st.error("Failed to load data. Please check your database connection settings.")
+            st.error("No data found or failed to load data. Please check:")
+            st.info("""
+            1. Database tables exist (transactions, onboarding)
+            2. Tables have data for selected date range
+            3. Internet connection is working
+            4. Database is accessible from your location
+            """)
     
     else:
         # Show welcome message
@@ -1197,10 +1330,9 @@ def main():
         
         ### 🚀 Getting Started
         
-        1. **Configure Database Connection** in the sidebar
-        2. **Select Date Range** for analysis
-        3. **Choose Period Type** (Monthly/Weekly/Rolling)
-        4. Click **"Load Data & Generate Report"** button
+        1. **Select Date Range** in the sidebar
+        2. **Choose Period Type** (Monthly/Weekly/Rolling)
+        3. Click **"Load Data & Generate Report"** button
         
         ### 📊 Available Reports
         
@@ -1209,6 +1341,12 @@ def main():
         - **Product Usage**: Detailed product performance analysis
         - **Customer Activity**: User engagement metrics
         - **Data Export**: Download reports and raw data
+        
+        ### 🔧 Current Configuration
+        
+        **Database:** db4free.net  
+        **Database Name:** bdp_report  
+        **User:** lamin_d_kinteh
         
         ### ⚙️ Requirements
         
@@ -1221,15 +1359,20 @@ def main():
         - `account_id`, `mobile`, `registration_date`, `kyc_status`, `status`, `entity`
         """)
         
-        # Show sample configuration
-        with st.expander("🔧 Sample Database Configuration", expanded=False):
-            st.code("""
-            MySQL Host: localhost
-            MySQL User: root
-            MySQL Password: your_password
-            Database Name: business_dashboard
-            MySQL Port: 3306
-            """, language="bash")
+        # Quick start buttons
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            if st.button("📅 Last 30 Days", use_container_width=True):
+                st.session_state.quick_start = "last_30_days"
+                st.rerun()
+        with col2:
+            if st.button("📆 Current Month", use_container_width=True):
+                st.session_state.quick_start = "current_month"
+                st.rerun()
+        with col3:
+            if st.button("📊 Full Period", use_container_width=True):
+                st.session_state.quick_start = "full_period"
+                st.rerun()
 
 if __name__ == "__main__":
     main()
