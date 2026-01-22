@@ -96,7 +96,7 @@ class PerformanceReportGenerator:
                 port=3306,  # Default MySQL port
                 user='lamin_d_kinteh',
                 password='Lamin@123',
-                database='your_database_name',  # Add your database name
+                database='bdp_report',  # Add your database name
                 charset='utf8mb4',
                 cursorclass=pymysql.cursors.DictCursor
             )
