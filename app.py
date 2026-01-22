@@ -2,8 +2,9 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
-import mysql.connector
-from mysql.connector import Error
+# CHANGE THESE 2 LINES ONLY:
+import pymysql
+from pymysql import Error
 import plotly.graph_objects as go
 import plotly.express as px
 from plotly.subplots import make_subplots
@@ -25,40 +26,42 @@ class DatabaseManager:
     def connect(self):
         """Connect to MySQL database"""
         try:
-            self.connection = mysql.connector.connect(
+            # CHANGE THIS CONNECTION METHOD:
+            self.connection = pymysql.connect(
                 host='db4free.net',
                 database='bdp_report',
                 user='lamin_d_kinteh',
                 password='Lamin@123',
-                port=3306
+                port=3306,
+                charset='utf8mb4',
+                cursorclass=pymysql.cursors.DictCursor
             )
-            if self.connection.is_connected():
-                return True
+            return True
         except Error as e:
             st.error(f"Error connecting to MySQL database: {e}")
             return False
     
     def disconnect(self):
         """Disconnect from database"""
-        if self.connection and self.connection.is_connected():
+        if self.connection:
             self.connection.close()
     
     def execute_query(self, query, params=None):
         """Execute SQL query and return DataFrame"""
         try:
-            cursor = self.connection.cursor(dictionary=True)
-            if params:
-                cursor.execute(query, params)
-            else:
-                cursor.execute(query)
-            
-            result = cursor.fetchall()
-            cursor.close()
-            
-            if result:
-                return pd.DataFrame(result)
-            else:
-                return pd.DataFrame()
+            # CHANGE THIS TO USE WITH STATEMENT:
+            with self.connection.cursor() as cursor:
+                if params:
+                    cursor.execute(query, params)
+                else:
+                    cursor.execute(query)
+                
+                result = cursor.fetchall()
+                
+                if result:
+                    return pd.DataFrame(result)
+                else:
+                    return pd.DataFrame()
         except Error as e:
             st.error(f"Error executing query: {e}")
             return pd.DataFrame()
