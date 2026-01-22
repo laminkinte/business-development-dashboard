@@ -55,9 +55,7 @@ class DatabaseManager:
                 result = cursor.fetchall()
                 
                 if result:
-                    # Get column names from cursor description
-                    columns = [desc[0] for desc in cursor.description]
-                    return pd.DataFrame(result, columns=columns)
+                    return pd.DataFrame(result)
                 else:
                     return pd.DataFrame()
         except Exception as e:
@@ -73,7 +71,7 @@ class PerformanceDashboard:
         self.start_date_overall = datetime(2025, 10, 1)
         self.end_date_overall = min(datetime(2026, 1, 14), self.today)
         
-        # Product categories
+        # Product categories - UPDATED based on your database
         self.product_categories = {
             'P2P (Internal Wallet Transfer)': ['Internal Wallet Transfer'],
             'Cash-In': ['Deposit'],
@@ -98,62 +96,27 @@ class PerformanceDashboard:
             return False
         
         try:
-            # First, let's check what columns exist in the Transaction table
-            st.info("🔍 Checking database structure...")
-            
-            # Get column names from Transaction table
-            column_check_query = """
-                SELECT COLUMN_NAME 
-                FROM INFORMATION_SCHEMA.COLUMNS 
-                WHERE TABLE_SCHEMA = 'bdp_report' 
-                AND TABLE_NAME = 'Transaction'
-            """
-            columns_df = self.db.execute_query(column_check_query)
-            
-            if not columns_df.empty:
-                st.write("📋 Available columns in Transaction table:")
-                st.write(columns_df['COLUMN_NAME'].tolist())
-            
-            # Try different possible date column names
-            date_columns_to_try = ['Created_At', 'created_at', 'Created At', 'CREATED_AT', 'createdAt']
-            date_column_found = None
-            
-            for date_col in date_columns_to_try:
-                test_query = f"""
-                    SELECT COUNT(*) as count 
-                    FROM Transaction 
-                    WHERE `{date_col}` IS NOT NULL
-                    LIMIT 1
-                """
-                try:
-                    test_result = self.db.execute_query(test_query)
-                    if not test_result.empty and test_result['count'].iloc[0] > 0:
-                        date_column_found = date_col
-                        st.success(f"✅ Found date column: {date_column_found}")
-                        break
-                except:
-                    continue
-            
-            if not date_column_found:
-                st.error("❌ Could not find a date column in Transaction table")
-                # Try a simple query without date filter
-                transaction_query = "SELECT * FROM Transaction LIMIT 10"
-                self.transactions = self.db.execute_query(transaction_query)
-                
-                if not self.transactions.empty:
-                    st.write("📋 Sample Transaction data (first 10 rows):")
-                    st.dataframe(self.transactions)
-                
-                self.db.disconnect()
-                return False
-            
-            # Load transaction data with the found date column
             st.info("📥 Loading transaction data from database...")
-            transaction_query = f"""
-                SELECT * FROM Transaction 
-                WHERE `{date_column_found}` IS NOT NULL 
-                AND `{date_column_found}` >= %s 
-                AND `{date_column_found}` <= %s
+            
+            # Use the correct column names from your database
+            transaction_query = """
+                SELECT 
+                    id,
+                    user_identifier,
+                    entity_name,
+                    product_name,
+                    transaction_type,
+                    amount,
+                    status,
+                    internal_status,
+                    service_name,
+                    ucp_name,
+                    created_at,
+                    sub_transaction_id
+                FROM Transaction 
+                WHERE created_at IS NOT NULL 
+                AND created_at >= %s 
+                AND created_at <= %s
             """
             
             self.transactions = self.db.execute_query(
@@ -163,34 +126,20 @@ class PerformanceDashboard:
             
             if self.transactions.empty:
                 st.warning("⚠️ No transaction data found for the specified period")
-                # Try without date filter to see if there's any data
-                all_transactions_query = "SELECT * FROM Transaction LIMIT 100"
-                all_transactions = self.db.execute_query(all_transactions_query)
-                
-                if not all_transactions.empty:
-                    st.info(f"📊 Found {len(all_transactions)} total transactions in database")
-                    # Show available dates
-                    if date_column_found in all_transactions.columns:
-                        all_transactions[date_column_found] = pd.to_datetime(all_transactions[date_column_found], errors='coerce')
-                        min_date = all_transactions[date_column_found].min()
-                        max_date = all_transactions[date_column_found].max()
-                        st.info(f"📅 Date range in database: {min_date} to {max_date}")
                 return False
             
             st.success(f"✅ Loaded {len(self.transactions)} transaction records")
             
-            # Parse dates in transactions using the found column name
-            if date_column_found in self.transactions.columns:
-                self.transactions[date_column_found] = pd.to_datetime(
-                    self.transactions[date_column_found], errors='coerce'
+            # Parse dates in transactions
+            if 'created_at' in self.transactions.columns:
+                self.transactions['created_at'] = pd.to_datetime(
+                    self.transactions['created_at'], errors='coerce'
                 )
-                # Create a standardized column name for internal use
-                self.transactions['Created_At'] = self.transactions[date_column_found]
             
             # Clean numeric columns
-            if 'Amount' in self.transactions.columns:
-                self.transactions['Amount'] = pd.to_numeric(
-                    self.transactions['Amount'].astype(str)
+            if 'amount' in self.transactions.columns:
+                self.transactions['amount'] = pd.to_numeric(
+                    self.transactions['amount'].astype(str)
                     .str.replace(',', '')
                     .str.replace(' ', '')
                     .str.replace('D', '')
@@ -200,80 +149,79 @@ class PerformanceDashboard:
                     errors='coerce'
                 )
             
+            # Standardize column names for internal use
+            self.transactions = self.transactions.rename(columns={
+                'user_identifier': 'User_Identifier',
+                'entity_name': 'Entity_Name',
+                'product_name': 'Product_Name',
+                'transaction_type': 'Transaction_Type',
+                'amount': 'Amount',
+                'status': 'Status',
+                'service_name': 'Service_Name',
+                'ucp_name': 'UCP_Name',
+                'created_at': 'Created_At'
+            })
+            
             # Load onboarding data
             st.info("📥 Loading onboarding data from database...")
             
-            # Check onboarding table columns
-            onboarding_column_query = """
-                SELECT COLUMN_NAME 
-                FROM INFORMATION_SCHEMA.COLUMNS 
-                WHERE TABLE_SCHEMA = 'bdp_report' 
-                AND TABLE_NAME = 'Onboarding'
+            onboarding_query = """
+                SELECT 
+                    account_id,
+                    full_name,
+                    mobile,
+                    email,
+                    region,
+                    district,
+                    town_village,
+                    business_name,
+                    kyc_status,
+                    registration_date,
+                    updated_at,
+                    proof_of_id,
+                    identification_number,
+                    customer_referrer_code,
+                    customer_referrer_mobile,
+                    referrer_entity,
+                    entity,
+                    bank,
+                    bank_account_name,
+                    bank_account_number,
+                    status
+                FROM Onboarding 
+                WHERE registration_date IS NOT NULL 
+                AND registration_date >= %s 
+                AND registration_date <= %s
             """
-            onboarding_columns = self.db.execute_query(onboarding_column_query)
             
-            if not onboarding_columns.empty:
-                st.write("📋 Available columns in Onboarding table:")
-                st.write(onboarding_columns['COLUMN_NAME'].tolist())
+            self.onboarding = self.db.execute_query(
+                onboarding_query,
+                (self.start_date_overall, self.end_date_overall)
+            )
             
-            # Try to find registration date column
-            reg_date_columns_to_try = ['Registration_Date', 'registration_date', 'Registration Date', 'REGISTRATION_DATE', 'registrationDate']
-            reg_date_column_found = None
-            
-            for reg_col in reg_date_columns_to_try:
-                test_query = f"""
-                    SELECT COUNT(*) as count 
-                    FROM Onboarding 
-                    WHERE `{reg_col}` IS NOT NULL
-                    LIMIT 1
-                """
-                try:
-                    test_result = self.db.execute_query(test_query)
-                    if not test_result.empty and test_result['count'].iloc[0] > 0:
-                        reg_date_column_found = reg_col
-                        st.success(f"✅ Found registration date column: {reg_date_column_found}")
-                        break
-                except:
-                    continue
-            
-            if reg_date_column_found:
-                onboarding_query = f"""
-                    SELECT * FROM Onboarding 
-                    WHERE `{reg_date_column_found}` IS NOT NULL 
-                    AND `{reg_date_column_found}` >= %s 
-                    AND `{reg_date_column_found}` <= %s
-                """
+            if not self.onboarding.empty:
+                st.success(f"✅ Loaded {len(self.onboarding)} onboarding records")
                 
-                self.onboarding = self.db.execute_query(
-                    onboarding_query,
-                    (self.start_date_overall, self.end_date_overall)
-                )
+                # Parse dates in onboarding
+                if 'registration_date' in self.onboarding.columns:
+                    self.onboarding['registration_date'] = pd.to_datetime(
+                        self.onboarding['registration_date'], errors='coerce'
+                    )
                 
-                if not self.onboarding.empty:
-                    st.success(f"✅ Loaded {len(self.onboarding)} onboarding records")
-                    
-                    # Parse dates in onboarding
-                    if reg_date_column_found in self.onboarding.columns:
-                        self.onboarding[reg_date_column_found] = pd.to_datetime(
-                            self.onboarding[reg_date_column_found], errors='coerce'
-                        )
-                        # Create standardized column name
-                        self.onboarding['Registration_Date'] = self.onboarding[reg_date_column_found]
-                else:
-                    st.warning("⚠️ No onboarding data found for the specified period")
-                    # Try without date filter
-                    all_onboarding_query = "SELECT * FROM Onboarding LIMIT 100"
-                    all_onboarding = self.db.execute_query(all_onboarding_query)
-                    if not all_onboarding.empty:
-                        st.info(f"📊 Found {len(all_onboarding)} total onboarding records")
-                    self.onboarding = pd.DataFrame()
-            else:
-                st.warning("⚠️ Could not find registration date column in Onboarding table")
-                self.onboarding = pd.DataFrame()
-            
-            # Create User Identifier if Mobile column exists
-            if not self.onboarding.empty and 'Mobile' in self.onboarding.columns:
+                # Standardize column names
+                self.onboarding = self.onboarding.rename(columns={
+                    'mobile': 'Mobile',
+                    'entity': 'Entity',
+                    'kyc_status': 'KYC_Status',
+                    'status': 'Status',
+                    'registration_date': 'Registration_Date'
+                })
+                
+                # Create User Identifier for merging
                 self.onboarding['User_Identifier'] = self.onboarding['Mobile'].astype(str).str.strip()
+            else:
+                st.warning("⚠️ No onboarding data found for the specified period")
+                self.onboarding = pd.DataFrame()
             
             self.db.disconnect()
             
@@ -362,6 +310,11 @@ class PerformanceDashboard:
         # Get customer counts
         if not period_onboarding.empty and 'Entity' in period_onboarding.columns:
             customer_counts = {}
+            # Check what status values actually exist
+            if 'Status' in period_onboarding.columns:
+                unique_statuses = period_onboarding['Status'].unique()
+                st.info(f"📊 Found status values: {list(unique_statuses)}")
+            
             for status in ['Active', 'Registered', 'TemporaryRegister']:
                 status_customers = period_onboarding[
                     (period_onboarding['Entity'] == 'Customer') & 
@@ -408,12 +361,16 @@ class PerformanceDashboard:
             ]
             
             if not customer_transactions.empty:
+                # Check what products exist
+                unique_products = customer_transactions['Product_Name'].unique()
+                st.info(f"📊 Found products: {list(unique_products)}")
+                
                 # Handle P2P transactions
                 p2p_mask = (customer_transactions['Product_Name'] == 'Internal Wallet Transfer')
                 if 'Transaction_Type' in customer_transactions.columns:
                     p2p_mask = p2p_mask & (customer_transactions['Transaction_Type'] == 'DR')
                 if 'UCP_Name' in customer_transactions.columns:
-                    p2p_mask = p2p_mask & (~customer_transactions['UCP_Name'].str.contains('Fee', case=False, na=False))
+                    p2p_mask = p2p_mask & (~customer_transactions['UCP_Name'].astype(str).str.contains('Fee', case=False, na=False))
                 
                 p2p_transactions = customer_transactions[p2p_mask]
                 other_transactions = customer_transactions[
@@ -519,6 +476,16 @@ class PerformanceDashboard:
                 (period_transactions['Status'] == 'SUCCESS')
             ]
             
+            if not customer_transactions.empty:
+                # Check what products and services exist
+                if 'Product_Name' in customer_transactions.columns:
+                    unique_products = customer_transactions['Product_Name'].dropna().unique()
+                    st.info(f"📊 Products in transactions: {list(unique_products)}")
+                
+                if 'Service_Name' in customer_transactions.columns:
+                    unique_services = customer_transactions['Service_Name'].dropna().unique()
+                    st.info(f"📊 Services in transactions: {list(unique_services)}")
+            
             for category, products in self.product_categories.items():
                 for product in products:
                     if product == 'Internal Wallet Transfer':
@@ -528,7 +495,7 @@ class PerformanceDashboard:
                         ]
                         if 'UCP_Name' in product_trans.columns:
                             product_trans = product_trans[
-                                ~product_trans['UCP_Name'].str.contains('Fee', case=False, na=False)
+                                ~product_trans['UCP_Name'].astype(str).str.contains('Fee', case=False, na=False)
                             ]
                     else:
                         product_trans = customer_transactions[
@@ -797,21 +764,6 @@ class PerformanceDashboard:
                 low_product = exec_snapshot.get('low_product', 'N/A')
                 low_count = exec_snapshot.get('low_product_count', 0)
                 st.metric("Lowest Product", f"{low_product}", delta=f"{low_count} txn", delta_color="inverse")
-            
-            # Show product categories performance
-            product_usage = period_data.get('product_usage', {})
-            if product_usage:
-                categories = {}
-                for product, metrics in product_usage.items():
-                    category = metrics.get('category', 'Other')
-                    if category not in categories:
-                        categories[category] = 0
-                    categories[category] += metrics.get('total_transactions', 0)
-                
-                if categories:
-                    st.write("**Transactions by Category:**")
-                    for category, count in categories.items():
-                        st.write(f"- {category}: {count}")
     
     def display_acquisition_details(self, period_data):
         """Display customer acquisition details"""
@@ -832,30 +784,6 @@ class PerformanceDashboard:
             st.subheader("🚀 Activation")
             st.metric("First-Time Transactors", acquisition.get('ftt', 0))
             st.metric("FTT Rate", f"{acquisition.get('ftt_rate', 0):.1f}%")
-            
-            # Visualize FTT rate
-            fig = go.Figure(go.Indicator(
-                mode="gauge+number",
-                value=acquisition.get('ftt_rate', 0),
-                title={'text': "FTT Rate %"},
-                domain={'x': [0, 1], 'y': [0, 1]},
-                gauge={
-                    'axis': {'range': [None, 100]},
-                    'bar': {'color': "darkblue"},
-                    'steps': [
-                        {'range': [0, 30], 'color': "lightgray"},
-                        {'range': [30, 70], 'color': "gray"},
-                        {'range': [70, 100], 'color': "darkgray"}
-                    ],
-                    'threshold': {
-                        'line': {'color': "red", 'width': 4},
-                        'thickness': 0.75,
-                        'value': 50
-                    }
-                }
-            ))
-            fig.update_layout(height=250)
-            st.plotly_chart(fig, use_container_width=True)
     
     def display_product_details(self, period_data):
         """Display product usage details"""
@@ -880,22 +808,6 @@ class PerformanceDashboard:
         if product_data:
             df = pd.DataFrame(product_data)
             
-            # Summary metrics
-            col1, col2, col3, col4 = st.columns(4)
-            with col1:
-                total_transactions = df['Total Transactions'].sum()
-                st.metric("Total Transactions", total_transactions)
-            with col2:
-                total_users = df['Unique Users'].sum()
-                st.metric("Total Users", total_users)
-            with col3:
-                total_value = df['Transaction Value'].sum()
-                st.metric("Total Value", f"${total_value:,.2f}")
-            with col4:
-                avg_trans_per_user = total_transactions / total_users if total_users > 0 else 0
-                st.metric("Avg Tx/User", f"{avg_trans_per_user:.1f}")
-            
-            # Product performance chart
             st.subheader("📊 Product Performance")
             
             tab1, tab2 = st.tabs(["📈 Transactions", "👥 Users"])
@@ -925,14 +837,6 @@ class PerformanceDashboard:
                 )
                 fig.update_layout(xaxis_tickangle=-45)
                 st.plotly_chart(fig, use_container_width=True)
-            
-            # Detailed table
-            st.subheader("📋 Detailed Product Metrics")
-            st.dataframe(
-                df.sort_values('Total Transactions', ascending=False),
-                use_container_width=True,
-                hide_index=True
-            )
     
     def display_activity_details(self, period_data):
         """Display customer activity details"""
@@ -949,38 +853,6 @@ class PerformanceDashboard:
         with col3:
             avg_trans = activity.get('avg_transactions_per_user', 0)
             st.metric("Avg Transactions/User", f"{avg_trans:.1f}")
-        
-        # Additional metrics
-        col4, col5 = st.columns(2)
-        
-        with col4:
-            avg_products = activity.get('avg_products_per_user', 0)
-            st.metric("Avg Products/User", f"{avg_products:.1f}")
-            
-            if activity.get('wau', 0) > 0:
-                trans_per_active = activity.get('total_transactions', 0) / activity.get('wau', 0)
-                st.metric("Transactions/Active User", f"{trans_per_active:.1f}")
-        
-        with col5:
-            # Create a simple gauge for engagement
-            engagement_score = min(100, activity.get('avg_transactions_per_user', 0) * 10)
-            fig = go.Figure(go.Indicator(
-                mode="gauge+number",
-                value=engagement_score,
-                title={'text': "Engagement Score"},
-                domain={'x': [0, 1], 'y': [0, 1]},
-                gauge={
-                    'axis': {'range': [None, 100]},
-                    'bar': {'color': "green"},
-                    'steps': [
-                        {'range': [0, 33], 'color': "lightcoral"},
-                        {'range': [33, 66], 'color': "lightyellow"},
-                        {'range': [66, 100], 'color': "lightgreen"}
-                    ]
-                }
-            ))
-            fig.update_layout(height=250)
-            st.plotly_chart(fig, use_container_width=True)
     
     def display_executive_summary(self, all_period_data):
         """Display executive summary across all periods"""
@@ -988,48 +860,30 @@ class PerformanceDashboard:
         periods = []
         new_customers = []
         active_customers = []
-        top_products = []
         
         for period_name, data in all_period_data.items():
             periods.append(period_name)
             exec_snapshot = data.get('executive_snapshot', {})
             new_customers.append(exec_snapshot.get('new_customers_total', 0))
             active_customers.append(exec_snapshot.get('active_customers_all', 0))
-            top_products.append(exec_snapshot.get('top_product', 'N/A'))
         
         # Create summary DataFrame
         summary_df = pd.DataFrame({
             'Period': periods,
             'New Customers': new_customers,
-            'Active Customers': active_customers,
-            'Top Product': top_products
+            'Active Customers': active_customers
         })
         
-        # Charts
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            fig = px.line(
-                summary_df,
-                x='Period',
-                y=['New Customers', 'Active Customers'],
-                title="Customer Growth Trends",
-                markers=True
-            )
-            fig.update_layout(xaxis_tickangle=-45)
-            st.plotly_chart(fig, use_container_width=True)
-        
-        with col2:
-            # Top products frequency
-            top_product_counts = summary_df['Top Product'].value_counts().head(10)
-            fig = px.bar(
-                x=top_product_counts.index,
-                y=top_product_counts.values,
-                title="Most Frequent Top Products",
-                labels={'x': 'Product', 'y': 'Times as Top Product'}
-            )
-            fig.update_layout(xaxis_tickangle=-45)
-            st.plotly_chart(fig, use_container_width=True)
+        # Chart
+        fig = px.line(
+            summary_df,
+            x='Period',
+            y=['New Customers', 'Active Customers'],
+            title="Customer Growth Trends",
+            markers=True
+        )
+        fig.update_layout(xaxis_tickangle=-45)
+        st.plotly_chart(fig, use_container_width=True)
         
         # Period comparison table
         st.subheader("📋 Period Comparison")
@@ -1041,64 +895,29 @@ class PerformanceDashboard:
         periods = []
         registrations = []
         ftt_counts = []
-        ftt_rates = []
         
         for period_name, data in all_period_data.items():
             periods.append(period_name)
             acquisition = data.get('customer_acquisition', {})
             registrations.append(acquisition.get('new_registrations_total', 0))
             ftt_counts.append(acquisition.get('ftt', 0))
-            ftt_rates.append(acquisition.get('ftt_rate', 0))
         
         analysis_df = pd.DataFrame({
             'Period': periods,
             'Registrations': registrations,
-            'FTT Count': ftt_counts,
-            'FTT Rate %': ftt_rates
+            'FTT Count': ftt_counts
         })
         
-        # Charts
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            fig = px.bar(
-                analysis_df,
-                x='Period',
-                y=['Registrations', 'FTT Count'],
-                title="Registrations vs FTT",
-                barmode='group'
-            )
-            fig.update_layout(xaxis_tickangle=-45)
-            st.plotly_chart(fig, use_container_width=True)
-        
-        with col2:
-            fig = px.line(
-                analysis_df,
-                x='Period',
-                y='FTT Rate %',
-                title="FTT Rate Trend",
-                markers=True
-            )
-            fig.update_layout(xaxis_tickangle=-45)
-            st.plotly_chart(fig, use_container_width=True)
-        
-        # FTT Analysis
-        st.subheader("🎯 First-Time Transactor Analysis")
-        
-        total_registrations = sum(registrations)
-        total_ftt = sum(ftt_counts)
-        overall_ftt_rate = (total_ftt / total_registrations * 100) if total_registrations > 0 else 0
-        
-        col3, col4, col5 = st.columns(3)
-        with col3:
-            st.metric("Total Registrations", total_registrations)
-        with col4:
-            st.metric("Total FTT", total_ftt)
-        with col5:
-            st.metric("Overall FTT Rate", f"{overall_ftt_rate:.1f}%")
-        
-        # Detailed table
-        st.dataframe(analysis_df, use_container_width=True, hide_index=True)
+        # Chart
+        fig = px.bar(
+            analysis_df,
+            x='Period',
+            y=['Registrations', 'FTT Count'],
+            title="Registrations vs FTT",
+            barmode='group'
+        )
+        fig.update_layout(xaxis_tickangle=-45)
+        st.plotly_chart(fig, use_container_width=True)
     
     def display_product_analysis(self, all_period_data):
         """Display product analysis across all periods"""
@@ -1131,9 +950,7 @@ class PerformanceDashboard:
                 'Product': product,
                 'Category': data['category'],
                 'Total Transactions': data['total_transactions'],
-                'Total Users': data['total_users'],
-                'Periods Active': data['periods_active'],
-                'Avg Trans/Period': data['total_transactions'] / data['periods_active'] if data['periods_active'] > 0 else 0
+                'Total Users': data['total_users']
             }
             for product, data in product_performance.items()
         ])
@@ -1154,57 +971,6 @@ class PerformanceDashboard:
             )
             fig.update_layout(xaxis_tickangle=-45)
             st.plotly_chart(fig, use_container_width=True)
-        
-        with col2:
-            top_by_users = product_df.nlargest(10, 'Total Users')
-            fig = px.bar(
-                top_by_users,
-                x='Product',
-                y='Total Users',
-                color='Category',
-                title="Top 10 Products by Users"
-            )
-            fig.update_layout(xaxis_tickangle=-45)
-            st.plotly_chart(fig, use_container_width=True)
-        
-        # Product categories analysis
-        st.subheader("📊 Product Category Analysis")
-        
-        category_df = product_df.groupby('Category').agg({
-            'Total Transactions': 'sum',
-            'Total Users': 'sum',
-            'Product': 'count'
-        }).reset_index()
-        category_df = category_df.rename(columns={'Product': 'Product Count'})
-        
-        col3, col4 = st.columns(2)
-        
-        with col3:
-            fig = px.pie(
-                category_df,
-                values='Total Transactions',
-                names='Category',
-                title="Transaction Distribution by Category"
-            )
-            st.plotly_chart(fig, use_container_width=True)
-        
-        with col4:
-            fig = px.bar(
-                category_df,
-                x='Category',
-                y='Product Count',
-                title="Number of Products per Category"
-            )
-            fig.update_layout(xaxis_tickangle=-45)
-            st.plotly_chart(fig, use_container_width=True)
-        
-        # Detailed product table
-        st.subheader("📋 Detailed Product Performance")
-        st.dataframe(
-            product_df.sort_values('Total Transactions', ascending=False),
-            use_container_width=True,
-            hide_index=True
-        )
 
 # Main Streamlit app
 def main():
@@ -1263,22 +1029,16 @@ def main():
     """)
     
     # Show initial message if no data loaded
-    if 'dashboard' in locals():
-        if not hasattr(dashboard, 'transactions'):
-            st.title("📊 Business Development Performance Dashboard")
-            st.info("👈 Click **'Load Data from Database'** in the sidebar to start analysis")
-            
-            # Show sample metrics
-            col1, col2, col3 = st.columns(3)
-            with col1:
-                st.metric("Database", "MySQL", "Ready")
-            with col2:
-                st.metric("Analysis Period", "Oct 2025 - Jan 2026")
-            with col3:
-                st.metric("Data Tables", "2", "Transaction, Onboarding")
-    else:
-        st.title("📊 Business Development Performance Dashboard")
-        st.info("👈 Click **'Load Data from Database'** in the sidebar to start analysis")
+    st.title("📊 Business Development Performance Dashboard")
+    st.info("👈 Click **'Load Data from Database'** in the sidebar to start analysis")
+    
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.metric("Database", "MySQL", "Ready")
+    with col2:
+        st.metric("Analysis Period", "Oct 2025 - Jan 2026")
+    with col3:
+        st.metric("Data Tables", "2", "Transaction, Onboarding")
 
 if __name__ == "__main__":
     main()
