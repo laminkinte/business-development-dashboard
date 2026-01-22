@@ -59,6 +59,9 @@ st.markdown("""
         border-radius: 10px;
         margin-bottom: 1rem;
     }
+    .stButton > button {
+        width: 100%;
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -110,7 +113,8 @@ class PerformanceReportGenerator:
         self.transactions = pd.DataFrame()
         self.onboarding = pd.DataFrame()
         
-        st.info(f"Report Period: {self.start_date_overall.strftime('%Y-%m-%d')} to {self.end_date_overall.strftime('%Y-%m-%d')}")
+        # Cache for performance
+        self._cache = {}
     
     def connect_to_mysql(self):
         """Connect to MySQL database"""
@@ -130,11 +134,21 @@ class PerformanceReportGenerator:
             return None
     
     def load_data_from_mysql(self, start_date=None, end_date=None):
-        """Load data from MySQL database"""
+        """Load data from MySQL database with performance optimizations"""
         if start_date is None:
             start_date = self.start_date_overall
         if end_date is None:
             end_date = self.end_date_overall
+        
+        # Create cache key
+        cache_key = f"data_{start_date}_{end_date}"
+        
+        # Check cache first
+        if cache_key in self._cache:
+            self.transactions, self.onboarding = self._cache[cache_key]
+            st.success("✓ Loaded data from cache")
+            self._display_data_quality()
+            return True
         
         progress_bar = st.progress(0)
         status_text = st.empty()
@@ -144,22 +158,19 @@ class PerformanceReportGenerator:
             if connection is None:
                 return False
             
-            # Load transaction data
+            # Load transaction data with optimized query
             status_text.text("Loading transaction data from MySQL...")
             progress_bar.progress(30)
             
             transaction_query = """
                 SELECT 
-                    id, user_identifier, transaction_id, sub_transaction_id,
-                    entity_name, full_name, created_by, status, internal_status,
-                    service_name, product_name, transaction_type, amount,
-                    before_balance, after_balance, ucp_name, wallet_name,
-                    pouch_name, reference, error_code, error_message,
-                    vendor_transaction_id, vendor_response_code, vendor_message,
-                    slug, remarks, created_at, business_hierarchy,
-                    parent_user_identifier, parent_full_name
+                    user_identifier, entity_name, status, product_name,
+                    service_name, transaction_type, amount, ucp_name,
+                    created_at
                 FROM Transaction
                 WHERE created_at BETWEEN %s AND %s
+                AND entity_name = 'Customer'
+                AND status = 'SUCCESS'
             """
             
             with connection.cursor() as cursor:
@@ -170,19 +181,16 @@ class PerformanceReportGenerator:
             st.success(f"✓ Loaded {len(self.transactions)} transaction records")
             progress_bar.progress(60)
             
-            # Load onboarding data
+            # Load onboarding data with optimized query
             status_text.text("Loading onboarding data from MySQL...")
             
             onboarding_query = """
                 SELECT 
-                    account_id, full_name, mobile, email, region, district,
-                    town_village, business_name, kyc_status, registration_date,
-                    updated_at, proof_of_id, identification_number,
-                    customer_referrer_code, customer_referrer_mobile,
-                    referrer_entity, entity, bank, bank_account_name,
-                    bank_account_number, status
+                    mobile, entity, kyc_status, registration_date,
+                    status
                 FROM Onboarding
                 WHERE registration_date BETWEEN %s AND %s
+                AND entity = 'Customer'
             """
             
             with connection.cursor() as cursor:
@@ -202,6 +210,9 @@ class PerformanceReportGenerator:
             
             connection.close()
             
+            # Cache the data
+            self._cache[cache_key] = (self.transactions.copy(), self.onboarding.copy())
+            
             # Display data quality metrics
             self._display_data_quality()
             
@@ -212,7 +223,7 @@ class PerformanceReportGenerator:
             return False
     
     def _preprocess_data(self):
-        """Preprocess loaded data"""
+        """Preprocess loaded data efficiently"""
         # Clean column names
         self.transactions.columns = self.transactions.columns.str.strip()
         self.onboarding.columns = self.onboarding.columns.str.strip()
@@ -231,18 +242,11 @@ class PerformanceReportGenerator:
         # Create User Identifier for merging
         if 'mobile' in self.onboarding.columns:
             self.onboarding['user_identifier'] = self.onboarding['mobile'].astype(str).str.strip()
-        
-        # Clean text columns
-        text_columns = ['user_identifier', 'product_name', 'entity_name', 'transaction_type', 
-                       'ucp_name', 'service_name', 'status', 'sub_transaction_id']
-        for col in text_columns:
-            if col in self.transactions.columns:
-                self.transactions[col] = self.transactions[col].astype(str).str.strip()
     
     def _display_data_quality(self):
         """Display data quality metrics"""
-        with st.expander("Data Quality Summary", expanded=False):
-            col1, col2 = st.columns(2)
+        with st.expander("📊 Data Quality Summary", expanded=False):
+            col1, col2, col3 = st.columns(3)
             
             with col1:
                 st.metric("Transactions", f"{len(self.transactions):,}")
@@ -253,36 +257,44 @@ class PerformanceReportGenerator:
                     success_rate = (self.transactions['status'] == 'SUCCESS').mean() * 100
                     st.metric("Transaction Success Rate", f"{success_rate:.1f}%")
                 
+                if 'product_name' in self.transactions.columns:
+                    unique_products = self.transactions['product_name'].nunique()
+                    st.metric("Unique Products", unique_products)
+            
+            with col3:
                 if 'status' in self.onboarding.columns:
                     active_users = (self.onboarding['status'] == 'Active').sum()
                     st.metric("Active Users", f"{active_users:,}")
-    
-    def get_date_filter_options(self):
-        """Get date filter options for Streamlit"""
-        date_options = {
-            'Full Period (Oct 2025 - Jan 2026)': (self.start_date_overall, self.end_date_overall),
-            'October 2025': (datetime(2025, 10, 1), datetime(2025, 10, 31)),
-            'November 2025': (datetime(2025, 11, 1), datetime(2025, 11, 30)),
-            'December 2025': (datetime(2025, 12, 1), datetime(2025, 12, 31)),
-            'January 2026 Week 1': (datetime(2026, 1, 1), datetime(2026, 1, 7)),
-            'January 2026 Week 2': (datetime(2026, 1, 8), datetime(2026, 1, 14)),
-            'Last 7 Days': (self.today - timedelta(days=7), self.today),
-            'Last 30 Days': (self.today - timedelta(days=30), self.today),
-            'Custom Range': 'custom'
-        }
-        return date_options
+                
+                if 'kyc_status' in self.onboarding.columns:
+                    verified_users = (self.onboarding['kyc_status'].str.upper() == 'VERIFIED').sum()
+                    st.metric("KYC Verified", f"{verified_users:,}")
     
     def filter_by_date_range(self, df, date_col, start_date, end_date):
-        """Filter dataframe by date range"""
-        if date_col not in df.columns:
+        """Filter dataframe by date range efficiently"""
+        if date_col not in df.columns or df.empty:
             return pd.DataFrame()
+        
+        # Create cache key for filtered data
+        cache_key = f"filtered_{date_col}_{start_date}_{end_date}_{len(df)}"
+        if cache_key in self._cache:
+            return self._cache[cache_key].copy()
         
         valid_dates = df[date_col].notna()
         mask = (df[date_col] >= start_date) & (df[date_col] <= end_date) & valid_dates
-        return df[mask].copy()
+        filtered_df = df[mask].copy()
+        
+        # Cache the filtered result
+        self._cache[cache_key] = filtered_df.copy()
+        
+        return filtered_df
     
     def get_new_registered_customers_segmented(self, start_date, end_date):
         """Get new registered customers segmented by Status"""
+        cache_key = f"new_customers_{start_date}_{end_date}"
+        if cache_key in self._cache:
+            return self._cache[cache_key]
+        
         period_onboarding = self.filter_by_date_range(
             self.onboarding, 'registration_date', start_date, end_date
         )
@@ -308,41 +320,44 @@ class PerformanceReportGenerator:
             segmented_counts['Total'] = valid_customers['user_identifier'].nunique()
             customer_lists['Total'] = valid_customers['user_identifier'].unique().tolist()
         
-        return segmented_counts, customer_lists
+        result = (segmented_counts, customer_lists)
+        self._cache[cache_key] = result
+        return result
     
     def get_active_customers_all(self, start_date, end_date, period_type):
         """Get ALL active customers (not just new ones) based on period type"""
+        cache_key = f"active_customers_{start_date}_{end_date}_{period_type}"
+        if cache_key in self._cache:
+            return self._cache[cache_key]
+        
         period_transactions = self.filter_by_date_range(
             self.transactions, 'created_at', start_date, end_date
         )
         
         if not period_transactions.empty:
-            # Filter successful customer transactions
-            customer_transactions = period_transactions[
-                (period_transactions['entity_name'] == 'Customer') &
-                (period_transactions['status'] == 'SUCCESS')
-            ]
+            # Different thresholds for different period types
+            if period_type == 'weekly' or period_type == 'rolling':
+                threshold = 2
+            else:  # monthly
+                threshold = 10
             
-            if not customer_transactions.empty:
-                # Count transactions per user
-                user_transaction_counts = customer_transactions.groupby('user_identifier').size()
-                
-                # Different thresholds for different period types
-                if period_type == 'weekly' or period_type == 'rolling':
-                    # Weekly/Rolling: Customers with >=2 transactions
-                    threshold = 2
-                else:  # monthly
-                    # Monthly: Customers with >=10 transactions
-                    threshold = 10
-                
-                active_users = user_transaction_counts[user_transaction_counts >= threshold].index.tolist()
-                
-                return active_users, len(active_users)
+            # Count transactions per user efficiently
+            user_transaction_counts = period_transactions['user_identifier'].value_counts()
+            active_users = user_transaction_counts[user_transaction_counts >= threshold].index.tolist()
+            
+            result = (active_users, len(active_users))
+        else:
+            result = ([], 0)
         
-        return [], 0
+        self._cache[cache_key] = result
+        return result
     
     def calculate_executive_snapshot(self, start_date, end_date, period_type):
         """Calculate Executive Snapshot metrics WITH SEGMENTED CUSTOMERS"""
+        cache_key = f"exec_snapshot_{start_date}_{end_date}_{period_type}"
+        if cache_key in self._cache:
+            return self._cache[cache_key]
+        
         metrics = {}
         
         # Get new registered customers SEGMENTED BY STATUS
@@ -360,36 +375,29 @@ class PerformanceReportGenerator:
         # Weekly Active Users (WAU) from new registered customers - BY STATUS
         wau_by_status = {'Active': 0, 'Registered': 0, 'TemporaryRegister': 0, 'Total': 0}
         
+        period_transactions = self.filter_by_date_range(
+            self.transactions, 'created_at', start_date, end_date
+        )
+        
         for status in ['Active', 'Registered', 'TemporaryRegister']:
             status_customers = segmented_lists[status]
-            if status_customers:
-                # Get transactions for status customers
-                period_transactions = self.filter_by_date_range(
-                    self.transactions, 'created_at', start_date, end_date
-                )
+            if status_customers and not period_transactions.empty:
+                # Filter to status customers' successful transactions
+                status_customer_transactions = period_transactions[
+                    period_transactions['user_identifier'].isin(status_customers)
+                ]
                 
-                if not period_transactions.empty:
-                    # Filter to status customers' successful transactions
-                    status_customer_transactions = period_transactions[
-                        (period_transactions['user_identifier'].isin(status_customers)) &
-                        (period_transactions['entity_name'] == 'Customer') &
-                        (period_transactions['status'] == 'SUCCESS')
-                    ]
+                if not status_customer_transactions.empty:
+                    # Count transactions per status customer
+                    status_customer_counts = status_customer_transactions['user_identifier'].value_counts()
                     
-                    if not status_customer_transactions.empty:
-                        # Count transactions per status customer
-                        status_customer_counts = status_customer_transactions.groupby('user_identifier').size()
-                        
-                        # Different thresholds for different period types
-                        if period_type in ['weekly', 'rolling']:
-                            # Weekly/Rolling: Status customers with >=2 transactions
-                            threshold = 2
-                        else:  # monthly
-                            # Monthly: Status customers with >=10 transactions
-                            threshold = 10
-                        
-                        active_status_customers = status_customer_counts[status_customer_counts >= threshold].index.tolist()
-                        wau_by_status[status] = len(active_status_customers)
+                    # Different thresholds for different period types
+                    if period_type in ['weekly', 'rolling']:
+                        threshold = 2
+                    else:  # monthly
+                        threshold = 10
+                    
+                    wau_by_status[status] = (status_customer_counts >= threshold).sum()
         
         metrics['wau_active'] = wau_by_status['Active']
         metrics['wau_registered'] = wau_by_status['Registered']
@@ -417,110 +425,76 @@ class PerformanceReportGenerator:
         metrics['net_growth_pct'] = net_growth
         
         # Top and Lowest Performing Products (by usage count)
-        period_transactions = self.filter_by_date_range(
-            self.transactions, 'created_at', start_date, end_date
-        )
-        
         if not period_transactions.empty and 'product_name' in period_transactions.columns:
-            # Filter to customer transactions
-            customer_transactions = period_transactions[
-                (period_transactions['entity_name'] == 'Customer') &
-                (period_transactions['status'] == 'SUCCESS') &
-                (period_transactions['product_name'].notna())
-            ]
+            # For P2P (Internal Wallet Transfer), we need special handling
+            product_counts_dict = {}
             
-            if not customer_transactions.empty:
-                # For P2P (Internal Wallet Transfer), we need special handling
-                product_counts_dict = {}
-                product_users_dict = {}
-                product_amount_dict = {}
-                
-                for product in customer_transactions['product_name'].unique():
-                    if product == 'Internal Wallet Transfer':
-                        # CORRECTED P2P COUNTING:
-                        # 1. Only count DR ledger (customer debits)
-                        # 2. Exclude fee transactions (UCP Name containing "Fee")
-                        p2p_transactions = customer_transactions[
-                            (customer_transactions['product_name'] == 'Internal Wallet Transfer') &
-                            (customer_transactions['transaction_type'] == 'DR')
-                        ]
-                        
-                        # Exclude fee transactions
-                        if 'ucp_name' in p2p_transactions.columns:
-                            p2p_transactions = p2p_transactions[
-                                ~p2p_transactions['ucp_name'].str.contains('Fee', case=False, na=False)
-                            ]
-                        
-                        product_counts_dict[product] = len(p2p_transactions)
-                        product_users_dict[product] = p2p_transactions['user_identifier'].nunique()
-                        product_amount_dict[product] = p2p_transactions['amount'].sum() if 'amount' in p2p_transactions.columns else 0
-                    else:
-                        # For other products, count all transactions
-                        product_transactions = customer_transactions[
-                            customer_transactions['product_name'] == product
-                        ]
-                        product_counts_dict[product] = len(product_transactions)
-                        product_users_dict[product] = product_transactions['user_identifier'].nunique()
-                        product_amount_dict[product] = product_transactions['amount'].sum() if 'amount' in product_transactions.columns else 0
-                
-                # Also include Airtime Topup as a service
-                if 'Airtime Topup' in self.services:
-                    airtime_transactions = period_transactions[
-                        (period_transactions['service_name'] == 'Airtime Topup') &
-                        (period_transactions['entity_name'] == 'Customer') &
-                        (period_transactions['status'] == 'SUCCESS') &
+            # Get regular products
+            for product in period_transactions['product_name'].unique():
+                if product == 'Internal Wallet Transfer':
+                    # CORRECTED P2P COUNTING
+                    p2p_transactions = period_transactions[
+                        (period_transactions['product_name'] == 'Internal Wallet Transfer') &
                         (period_transactions['transaction_type'] == 'DR')
                     ]
-                    product_counts_dict['Airtime Topup'] = len(airtime_transactions)
-                    product_users_dict['Airtime Topup'] = airtime_transactions['user_identifier'].nunique()
-                    product_amount_dict['Airtime Topup'] = airtime_transactions['amount'].sum() if 'amount' in airtime_transactions.columns else 0
-                
-                # Convert to Series for sorting
-                product_counts = pd.Series(product_counts_dict)
-                product_counts = product_counts.sort_values(ascending=False)
-                
-                if not product_counts.empty:
-                    # Get top performing product
-                    top_product = product_counts.index[0]
-                    top_product_count = int(product_counts.iloc[0])
                     
-                    # Get lowest performing product (with at least 1 transaction)
-                    active_products = product_counts[product_counts > 0]
-                    if not active_products.empty:
-                        low_product = active_products.index[-1]
-                        low_product_count = int(active_products.iloc[-1])
-                    else:
-                        low_product = 'N/A'
-                        low_product_count = 0
+                    # Exclude fee transactions
+                    if 'ucp_name' in p2p_transactions.columns:
+                        p2p_transactions = p2p_transactions[
+                            ~p2p_transactions['ucp_name'].str.contains('Fee', case=False, na=False)
+                        ]
                     
-                    metrics['top_product'] = top_product
-                    metrics['top_product_count'] = top_product_count
-                    metrics['top_product_users'] = product_users_dict.get(top_product, 0)
-                    metrics['top_product_amount'] = product_amount_dict.get(top_product, 0)
-                    
-                    metrics['low_product'] = low_product
-                    metrics['low_product_count'] = low_product_count
-                    metrics['low_product_users'] = product_users_dict.get(low_product, 0)
-                    metrics['low_product_amount'] = product_amount_dict.get(low_product, 0)
+                    product_counts_dict[product] = len(p2p_transactions)
                 else:
-                    metrics['top_product'] = 'N/A'
-                    metrics['low_product'] = 'N/A'
+                    product_transactions = period_transactions[
+                        period_transactions['product_name'] == product
+                    ]
+                    product_counts_dict[product] = len(product_transactions)
+            
+            # Include Airtime Topup as a service
+            if 'Airtime Topup' in self.services and 'service_name' in period_transactions.columns:
+                airtime_transactions = period_transactions[
+                    (period_transactions['service_name'] == 'Airtime Topup') &
+                    (period_transactions['transaction_type'] == 'DR')
+                ]
+                product_counts_dict['Airtime Topup'] = len(airtime_transactions)
+            
+            # Convert to Series for sorting
+            product_counts = pd.Series(product_counts_dict)
+            product_counts = product_counts.sort_values(ascending=False)
+            
+            if not product_counts.empty:
+                # Get top performing product
+                top_product = product_counts.index[0]
+                top_product_count = int(product_counts.iloc[0])
+                
+                # Get lowest performing product (with at least 1 transaction)
+                active_products = product_counts[product_counts > 0]
+                if not active_products.empty:
+                    low_product = active_products.index[-1]
+                    low_product_count = int(active_products.iloc[-1])
+                else:
+                    low_product = 'N/A'
+                    low_product_count = 0
+                
+                metrics['top_product'] = top_product
+                metrics['top_product_count'] = top_product_count
+                metrics['low_product'] = low_product
+                metrics['low_product_count'] = low_product_count
+            else:
+                metrics['top_product'] = 'N/A'
+                metrics['low_product'] = 'N/A'
         
+        self._cache[cache_key] = metrics
         return metrics
     
     def calculate_customer_acquisition(self, start_date, end_date, previous_start=None, previous_end=None):
         """Calculate Customer Acquisition metrics with comparison"""
+        cache_key = f"cust_acq_{start_date}_{end_date}"
+        if cache_key in self._cache:
+            return self._cache[cache_key]
+        
         metrics = {}
-        
-        # Filter onboarding for the period
-        period_onboarding = self.filter_by_date_range(
-            self.onboarding, 'registration_date', start_date, end_date
-        )
-        
-        # Filter transactions for the period
-        period_transactions = self.filter_by_date_range(
-            self.transactions, 'created_at', start_date, end_date
-        )
         
         # Get segmented customer counts
         segmented_counts, segmented_lists = self.get_new_registered_customers_segmented(start_date, end_date)
@@ -532,6 +506,10 @@ class PerformanceReportGenerator:
         metrics['new_registrations_total'] = segmented_counts['Total']
         
         # KYC Completed (Status = Active and KYC Status = Verified)
+        period_onboarding = self.filter_by_date_range(
+            self.onboarding, 'registration_date', start_date, end_date
+        )
+        
         if not period_onboarding.empty and 'kyc_status' in period_onboarding.columns and 'status' in period_onboarding.columns:
             kyc_completed = period_onboarding[
                 (period_onboarding['entity'] == 'Customer') &
@@ -544,17 +522,15 @@ class PerformanceReportGenerator:
         
         # First-Time Transactors (FTT) - New registered customers who transacted
         new_customers_total = segmented_lists['Total']
-        if new_customers_total and not period_transactions.empty:
-            # Get successful customer transactions
-            customer_transactions = period_transactions[
-                (period_transactions['entity_name'] == 'Customer') &
-                (period_transactions['status'] == 'SUCCESS')
-            ]
+        if new_customers_total:
+            period_transactions = self.filter_by_date_range(
+                self.transactions, 'created_at', start_date, end_date
+            )
             
-            if not customer_transactions.empty:
+            if not period_transactions.empty:
                 # Find new customers who transacted
-                transacting_new_customers = customer_transactions[
-                    customer_transactions['user_identifier'].isin(new_customers_total)
+                transacting_new_customers = period_transactions[
+                    period_transactions['user_identifier'].isin(new_customers_total)
                 ]['user_identifier'].unique()
                 
                 ftt_count = len(transacting_new_customers)
@@ -564,199 +540,136 @@ class PerformanceReportGenerator:
             ftt_count = 0
         metrics['ftt'] = ftt_count
         
-        # Previous period comparison if provided
-        if previous_start and previous_end:
-            prev_segmented_counts, _ = self.get_new_registered_customers_segmented(previous_start, previous_end)
-            
-            comparison = {}
-            for metric in ['new_registrations_total', 'kyc_completed', 'ftt']:
-                current = metrics.get(metric, 0) or 0
-                previous = prev_segmented_counts.get('Total', 0) if metric == 'new_registrations_total' else 0
-                
-                if previous > 0:
-                    growth = ((current - previous) / previous) * 100
-                else:
-                    growth = 0 if current > 0 else None
-                
-                comparison[metric] = {
-                    'current': current,
-                    'previous': previous,
-                    'growth': growth,
-                    'trend': '↑' if growth and growth > 5 else '↓' if growth and growth < -5 else '→'
-                }
-            
-            metrics['comparison'] = comparison
-        
+        self._cache[cache_key] = metrics
         return metrics
     
     def calculate_product_usage_performance(self, start_date, end_date, period_type, previous_start=None, previous_end=None):
         """Calculate Product Usage Performance metrics"""
+        cache_key = f"product_usage_{start_date}_{end_date}_{period_type}"
+        if cache_key in self._cache:
+            return self._cache[cache_key]
+        
         period_transactions = self.filter_by_date_range(
             self.transactions, 'created_at', start_date, end_date
         )
         
         product_metrics = {}
         
-        # Process regular products
-        for category, products in self.product_categories.items():
-            for product in products:
-                if product == 'Internal Wallet Transfer':
-                    # CORRECTED P2P COUNTING
-                    product_trans = period_transactions[
-                        (period_transactions['product_name'] == 'Internal Wallet Transfer') &
-                        (period_transactions['entity_name'] == 'Customer') &
-                        (period_transactions['status'] == 'SUCCESS') &
+        if not period_transactions.empty:
+            # Process regular products
+            for category, products in self.product_categories.items():
+                for product in products:
+                    if product == 'Internal Wallet Transfer':
+                        # CORRECTED P2P COUNTING
+                        product_trans = period_transactions[
+                            (period_transactions['product_name'] == 'Internal Wallet Transfer') &
+                            (period_transactions['transaction_type'] == 'DR')
+                        ]
+                        
+                        # Exclude fee transactions
+                        if 'ucp_name' in product_trans.columns:
+                            product_trans = product_trans[
+                                ~product_trans['ucp_name'].str.contains('Fee', case=False, na=False)
+                            ]
+                    
+                    else:
+                        # For other products
+                        product_trans = period_transactions[
+                            period_transactions['product_name'] == product
+                        ]
+                    
+                    if not product_trans.empty:
+                        # Active Users
+                        user_product_counts = product_trans['user_identifier'].value_counts()
+                        
+                        # Different thresholds for different period types
+                        if period_type in ['weekly', 'rolling']:
+                            threshold = 2
+                        else:  # monthly
+                            threshold = 10
+                        
+                        active_users_all = (user_product_counts >= threshold).sum()
+                        
+                        # Total metrics
+                        total_transactions = len(product_trans)
+                        total_amount = product_trans['amount'].sum() if 'amount' in product_trans.columns else 0
+                        total_users = product_trans['user_identifier'].nunique()
+                        avg_amount = total_amount / total_transactions if total_transactions > 0 else 0
+                        
+                        product_metrics[product] = {
+                            'category': category,
+                            'active_users_all': active_users_all,
+                            'total_transactions': total_transactions,
+                            'total_amount': total_amount,
+                            'avg_amount': avg_amount,
+                            'total_users': total_users,
+                            'period_type': period_type
+                        }
+                    else:
+                        product_metrics[product] = {
+                            'category': category,
+                            'active_users_all': 0,
+                            'total_transactions': 0,
+                            'total_amount': 0,
+                            'avg_amount': 0,
+                            'total_users': 0,
+                            'period_type': period_type
+                        }
+            
+            # Process Airtime Topup
+            for service in self.services:
+                if 'service_name' in period_transactions.columns:
+                    service_trans = period_transactions[
+                        (period_transactions['service_name'] == service) &
                         (period_transactions['transaction_type'] == 'DR')
                     ]
                     
-                    # Exclude fee transactions
-                    if 'ucp_name' in product_trans.columns:
-                        product_trans = product_trans[
-                            ~product_trans['ucp_name'].str.contains('Fee', case=False, na=False)
-                        ]
-                
-                else:
-                    # For other products
-                    product_trans = period_transactions[
-                        (period_transactions['product_name'] == product) &
-                        (period_transactions['entity_name'] == 'Customer') &
-                        (period_transactions['status'] == 'SUCCESS')
-                    ]
-                
-                if not product_trans.empty:
-                    # Active Users
-                    user_product_counts = product_trans.groupby('user_identifier').size()
-                    
-                    # Different thresholds for different period types
-                    if period_type in ['weekly', 'rolling']:
-                        threshold = 2
-                    else:  # monthly
-                        threshold = 10
-                    
-                    active_users_all = (user_product_counts >= threshold).sum()
-                    
-                    # Total metrics
-                    total_transactions = len(product_trans)
-                    total_amount = product_trans['amount'].sum() if 'amount' in product_trans.columns else 0
-                    total_users = product_trans['user_identifier'].nunique()
-                    avg_amount = total_amount / total_transactions if total_transactions > 0 else 0
-                    
-                    product_metrics[product] = {
-                        'category': category,
-                        'active_users_all': active_users_all,
-                        'total_transactions': total_transactions,
-                        'total_amount': total_amount,
-                        'avg_amount': avg_amount,
-                        'total_users': total_users,
-                        'period_type': period_type
-                    }
-                else:
-                    product_metrics[product] = {
-                        'category': category,
-                        'active_users_all': 0,
-                        'total_transactions': 0,
-                        'total_amount': 0,
-                        'avg_amount': 0,
-                        'total_users': 0,
-                        'period_type': period_type
-                    }
-                
-                # Trend if previous period provided
-                if previous_start and previous_end:
-                    prev_period_transactions = self.filter_by_date_range(
-                        self.transactions, 'created_at', previous_start, previous_end
-                    )
-                    
-                    if not prev_period_transactions.empty:
-                        if product == 'Internal Wallet Transfer':
-                            prev_product_trans = prev_period_transactions[
-                                (prev_period_transactions['product_name'] == 'Internal Wallet Transfer') &
-                                (prev_period_transactions['entity_name'] == 'Customer') &
-                                (prev_period_transactions['status'] == 'SUCCESS') &
-                                (prev_period_transactions['transaction_type'] == 'DR')
-                            ]
-                            
-                            if 'ucp_name' in prev_product_trans.columns:
-                                prev_product_trans = prev_product_trans[
-                                    ~prev_product_trans['ucp_name'].str.contains('Fee', case=False, na=False)
-                                ]
-                        else:
-                            prev_product_trans = prev_period_transactions[
-                                (prev_period_transactions['product_name'] == product) &
-                                (prev_period_transactions['entity_name'] == 'Customer') &
-                                (prev_period_transactions['status'] == 'SUCCESS')
-                            ]
+                    if not service_trans.empty:
+                        user_service_counts = service_trans['user_identifier'].value_counts()
                         
-                        prev_transactions_count = len(prev_product_trans)
+                        if period_type in ['weekly', 'rolling']:
+                            threshold = 2
+                        else:  # monthly
+                            threshold = 10
+                            
+                        active_users_all = (user_service_counts >= threshold).sum()
+                        
+                        total_transactions = len(service_trans)
+                        total_amount = service_trans['amount'].sum() if 'amount' in service_trans.columns else 0
+                        total_users = service_trans['user_identifier'].nunique()
+                        avg_amount = total_amount / total_transactions if total_transactions > 0 else 0
+                        
+                        product_metrics[service] = {
+                            'category': 'Airtime Topup',
+                            'active_users_all': active_users_all,
+                            'total_transactions': total_transactions,
+                            'total_amount': total_amount,
+                            'avg_amount': avg_amount,
+                            'total_users': total_users,
+                            'period_type': period_type,
+                            'trend': '→'
+                        }
                     else:
-                        prev_transactions_count = 0
-                    
-                    current_transactions = product_metrics[product]['total_transactions']
-                    
-                    if prev_transactions_count > 0:
-                        if current_transactions > prev_transactions_count * 1.05:
-                            trend = '↑'
-                        elif current_transactions < prev_transactions_count * 0.95:
-                            trend = '↓'
-                        else:
-                            trend = '→'
-                    else:
-                        trend = '↑' if current_transactions > 0 else '→'
-                    
-                    product_metrics[product]['trend'] = trend
-                else:
-                    product_metrics[product]['trend'] = '→'
+                        product_metrics[service] = {
+                            'category': 'Airtime Topup',
+                            'active_users_all': 0,
+                            'total_transactions': 0,
+                            'total_amount': 0,
+                            'avg_amount': 0,
+                            'total_users': 0,
+                            'period_type': period_type,
+                            'trend': '→'
+                        }
         
-        # Process Airtime Topup
-        for service in self.services:
-            service_trans = period_transactions[
-                (period_transactions['service_name'] == service) &
-                (period_transactions['entity_name'] == 'Customer') &
-                (period_transactions['status'] == 'SUCCESS') &
-                (period_transactions['transaction_type'] == 'DR')
-            ]
-            
-            if not service_trans.empty:
-                user_service_counts = service_trans.groupby('user_identifier').size()
-                
-                if period_type in ['weekly', 'rolling']:
-                    threshold = 2
-                else:  # monthly
-                    threshold = 10
-                    
-                active_users_all = (user_service_counts >= threshold).sum()
-                
-                total_transactions = len(service_trans)
-                total_amount = service_trans['amount'].sum() if 'amount' in service_trans.columns else 0
-                total_users = service_trans['user_identifier'].nunique()
-                avg_amount = total_amount / total_transactions if total_transactions > 0 else 0
-                
-                product_metrics[service] = {
-                    'category': 'Airtime Topup',
-                    'active_users_all': active_users_all,
-                    'total_transactions': total_transactions,
-                    'total_amount': total_amount,
-                    'avg_amount': avg_amount,
-                    'total_users': total_users,
-                    'period_type': period_type,
-                    'trend': '→'
-                }
-            else:
-                product_metrics[service] = {
-                    'category': 'Airtime Topup',
-                    'active_users_all': 0,
-                    'total_transactions': 0,
-                    'total_amount': 0,
-                    'avg_amount': 0,
-                    'total_users': 0,
-                    'period_type': period_type,
-                    'trend': '→'
-                }
-        
+        self._cache[cache_key] = product_metrics
         return product_metrics
     
     def calculate_customer_activity_engagement(self, start_date, end_date, period_type):
         """Calculate Customer Activity & Engagement metrics"""
+        cache_key = f"customer_activity_{start_date}_{end_date}_{period_type}"
+        if cache_key in self._cache:
+            return self._cache[cache_key]
+        
         period_transactions = self.filter_by_date_range(
             self.transactions, 'created_at', start_date, end_date
         )
@@ -764,62 +677,44 @@ class PerformanceReportGenerator:
         metrics = {}
         
         if not period_transactions.empty:
-            customer_transactions = period_transactions[
-                (period_transactions['entity_name'] == 'Customer') &
-                (period_transactions['status'] == 'SUCCESS')
-            ]
+            # Get active customers
+            wau_active, wau_count = self.get_active_customers_all(start_date, end_date, period_type)
+            metrics['wau'] = wau_count
             
-            if not customer_transactions.empty:
-                wau_active, wau_count = self.get_active_customers_all(start_date, end_date, period_type)
-                metrics['wau'] = wau_count
+            if wau_active:
+                active_user_transactions = period_transactions[
+                    period_transactions['user_identifier'].isin(wau_active)
+                ]
                 
-                if wau_active:
-                    active_user_transactions = customer_transactions[
-                        customer_transactions['user_identifier'].isin(wau_active)
-                    ]
+                if not active_user_transactions.empty:
+                    trans_per_active_user = active_user_transactions['user_identifier'].value_counts()
+                    avg_transactions_per_user = trans_per_active_user.mean()
                     
-                    if not active_user_transactions.empty:
-                        trans_per_active_user = active_user_transactions.groupby('user_identifier').size()
-                        avg_transactions_per_user = trans_per_active_user.mean()
-                        
-                        products_per_active_user = active_user_transactions.groupby('user_identifier')['product_name'].nunique()
-                        avg_products_per_user = products_per_active_user.mean()
-                    else:
-                        avg_transactions_per_user = 0
-                        avg_products_per_user = 0
+                    products_per_active_user = active_user_transactions.groupby('user_identifier')['product_name'].nunique()
+                    avg_products_per_user = products_per_active_user.mean()
                 else:
                     avg_transactions_per_user = 0
                     avg_products_per_user = 0
-                
-                metrics.update({
-                    'avg_transactions_per_user': avg_transactions_per_user,
-                    'avg_products_per_user': avg_products_per_user,
-                    'dormant_users': 0,
-                    'reactivated_users': 0,
-                    'total_transactions': len(customer_transactions),
-                    'period_type': period_type
-                })
             else:
-                metrics = {
-                    'wau': 0,
-                    'avg_transactions_per_user': 0,
-                    'avg_products_per_user': 0,
-                    'dormant_users': 0,
-                    'reactivated_users': 0,
-                    'total_transactions': 0,
-                    'period_type': period_type
-                }
+                avg_transactions_per_user = 0
+                avg_products_per_user = 0
+            
+            metrics.update({
+                'avg_transactions_per_user': avg_transactions_per_user,
+                'avg_products_per_user': avg_products_per_user,
+                'total_transactions': len(period_transactions),
+                'period_type': period_type
+            })
         else:
             metrics = {
                 'wau': 0,
                 'avg_transactions_per_user': 0,
                 'avg_products_per_user': 0,
-                'dormant_users': 0,
-                'reactivated_users': 0,
                 'total_transactions': 0,
                 'period_type': period_type
             }
         
+        self._cache[cache_key] = metrics
         return metrics
 
 def display_executive_snapshot(metrics, period_name):
@@ -840,7 +735,7 @@ def display_executive_snapshot(metrics, period_name):
         st.metric("Active Customers", metrics.get('active_customers_all', 0))
         growth = metrics.get('net_growth_pct', 0)
         growth_display = f"{growth:.1f}%" if growth is not None else "N/A"
-        delta = f"{growth:+.1f}%" if growth else None
+        delta = f"{growth:+.1f}%" if growth is not None else None
         st.metric("Net Growth %", growth_display, delta=delta)
     
     with col3:
@@ -888,138 +783,83 @@ def display_customer_acquisition(metrics):
         st.caption(f"FTT Rate: {ftt_rate:.1f}%")
     
     with col4:
-        activation_rate = metrics.get('activation_rate', 0)
-        reactivated = metrics.get('reactivated_count', 0)
-        st.metric("Activation Rate", f"{activation_rate:.1f}%" if activation_rate else "N/A")
-        st.caption(f"Reactivated Users: {reactivated}")
-    
-    # Display comparison if available
-    if 'comparison' in metrics:
-        st.markdown("#### 📈 Period Comparison")
-        comp_col1, comp_col2, comp_col3 = st.columns(3)
-        
-        with comp_col1:
-            comp = metrics['comparison'].get('new_registrations_total', {})
-            if comp:
-                delta = f"{comp.get('growth', 0):+.1f}%" if comp.get('growth') is not None else None
-                st.metric("New Reg Growth", comp.get('current', 0), delta=delta)
-        
-        with comp_col2:
-            comp = metrics['comparison'].get('ftt', {})
-            if comp:
-                delta = f"{comp.get('growth', 0):+.1f}%" if comp.get('growth') is not None else None
-                st.metric("FTT Growth", comp.get('current', 0), delta=delta)
-        
-        with comp_col3:
-            comp = metrics['comparison'].get('kyc_completed', {})
-            if comp:
-                delta = f"{comp.get('growth', 0):+.1f}%" if comp.get('growth') is not None else None
-                st.metric("KYC Growth", comp.get('current', 0), delta=delta)
+        # Activation metrics placeholder
+        st.metric("Customer Base Growth", f"{total_reg:,}")
+        st.caption("New registrations added")
 
 def display_product_usage(product_metrics):
     """Display Product Usage Performance"""
     st.markdown("<h3 class='sub-header'>Product Usage Performance</h3>", unsafe_allow_html=True)
+    
+    if not product_metrics:
+        st.info("No product usage data available for this period.")
+        return
     
     # Create dataframe for display
     product_data = []
     for product, metrics in product_metrics.items():
         product_data.append({
             'Product': product,
-            'Category': metrics['category'],
-            'Active Users': metrics['active_users_all'],
-            'Transactions': metrics['total_transactions'],
-            'Total Amount': metrics['total_amount'],
-            'Avg Amount': metrics['avg_amount'],
-            'Unique Users': metrics['total_users'],
-            'Trend': metrics['trend']
+            'Category': metrics.get('category', ''),
+            'Active Users': metrics.get('active_users_all', 0),
+            'Transactions': metrics.get('total_transactions', 0),
+            'Total Amount': metrics.get('total_amount', 0),
+            'Avg Amount': metrics.get('avg_amount', 0),
+            'Unique Users': metrics.get('total_users', 0)
         })
     
-    if product_data:
-        df = pd.DataFrame(product_data)
-        df = df.sort_values('Transactions', ascending=False)
-        
-        # Display top products in a table
-        st.dataframe(
-            df,
-            use_container_width=True,
-            hide_index=True,
-            column_config={
-                "Product": st.column_config.TextColumn("Product", width="medium"),
-                "Category": st.column_config.TextColumn("Category", width="small"),
-                "Active Users": st.column_config.NumberColumn("Active Users", format="%d"),
-                "Transactions": st.column_config.NumberColumn("Transactions", format="%d"),
-                "Total Amount": st.column_config.NumberColumn("Total Amount", format="GMD %.2f"),
-                "Avg Amount": st.column_config.NumberColumn("Avg Amount", format="GMD %.2f"),
-                "Unique Users": st.column_config.NumberColumn("Unique Users", format="%d"),
-                "Trend": st.column_config.TextColumn("Trend", width="small")
-            }
-        )
-        
-        # Visualizations
+    df = pd.DataFrame(product_data)
+    df = df.sort_values('Transactions', ascending=False)
+    
+    # Display products in a table
+    st.dataframe(
+        df,
+        hide_index=True,
+        width='stretch',
+        column_config={
+            "Product": st.column_config.TextColumn("Product", width="medium"),
+            "Category": st.column_config.TextColumn("Category", width="small"),
+            "Active Users": st.column_config.NumberColumn("Active Users", format="%d"),
+            "Transactions": st.column_config.NumberColumn("Transactions", format="%d"),
+            "Total Amount": st.column_config.NumberColumn("Total Amount", format="GMD %.2f"),
+            "Avg Amount": st.column_config.NumberColumn("Avg Amount", format="GMD %.2f"),
+            "Unique Users": st.column_config.NumberColumn("Unique Users", format="%d")
+        }
+    )
+    
+    # Visualizations
+    if len(df) > 0:
         col1, col2 = st.columns(2)
         
         with col1:
             # Top products by transactions
             top_products = df.head(10).sort_values('Transactions')
-            fig = px.bar(
-                top_products,
-                y='Product',
-                x='Transactions',
-                title='Top 10 Products by Transactions',
-                orientation='h',
-                color='Transactions',
-                color_continuous_scale='Blues'
-            )
-            fig.update_layout(height=400)
-            st.plotly_chart(fig, use_container_width=True)
+            if len(top_products) > 0:
+                fig = px.bar(
+                    top_products,
+                    y='Product',
+                    x='Transactions',
+                    title='Top Products by Transactions',
+                    orientation='h',
+                    color='Transactions',
+                    color_continuous_scale='Blues'
+                )
+                fig.update_layout(height=400)
+                st.plotly_chart(fig, use_container_width=True)
         
         with col2:
             # Product categories by active users
             category_data = df.groupby('Category')['Active Users'].sum().reset_index()
-            fig = px.pie(
-                category_data,
-                values='Active Users',
-                names='Category',
-                title='Active Users by Product Category',
-                hole=0.4
-            )
-            fig.update_layout(height=400)
-            st.plotly_chart(fig, use_container_width=True)
-        
-        # Additional visualizations
-        col3, col4 = st.columns(2)
-        
-        with col3:
-            # Product categories by transaction volume
-            category_trans = df.groupby('Category')['Transactions'].sum().reset_index()
-            fig = px.bar(
-                category_trans,
-                x='Category',
-                y='Transactions',
-                title='Transactions by Product Category',
-                color='Transactions',
-                color_continuous_scale='Greens'
-            )
-            fig.update_layout(height=400)
-            st.plotly_chart(fig, use_container_width=True)
-        
-        with col4:
-            # Active users vs transactions scatter plot
-            fig = px.scatter(
-                df,
-                x='Active Users',
-                y='Transactions',
-                size='Total Amount',
-                color='Category',
-                hover_name='Product',
-                title='Active Users vs Transactions by Product',
-                log_x=False,
-                log_y=False
-            )
-            fig.update_layout(height=400)
-            st.plotly_chart(fig, use_container_width=True)
-    else:
-        st.info("No product usage data available for this period.")
+            if len(category_data) > 0:
+                fig = px.pie(
+                    category_data,
+                    values='Active Users',
+                    names='Category',
+                    title='Active Users by Product Category',
+                    hole=0.4
+                )
+                fig.update_layout(height=400)
+                st.plotly_chart(fig, use_container_width=True)
 
 def display_customer_activity(metrics):
     """Display Customer Activity metrics"""
@@ -1038,14 +878,6 @@ def display_customer_activity(metrics):
     
     with col4:
         st.metric("Avg Products/User", f"{metrics.get('avg_products_per_user', 0):.2f}")
-    
-    # Additional metrics in expander
-    with st.expander("Additional Metrics"):
-        col5, col6 = st.columns(2)
-        with col5:
-            st.metric("Dormant Users", metrics.get('dormant_users', 0))
-        with col6:
-            st.metric("Reactivated Users", metrics.get('reactivated_users', 0))
 
 def main():
     """Main Streamlit application"""
@@ -1053,40 +885,68 @@ def main():
     st.markdown("<h1 class='main-header'>📊 Business Development Performance Dashboard</h1>", unsafe_allow_html=True)
     st.markdown("---")
     
+    # Initialize session state for caching
+    if 'generator' not in st.session_state:
+        st.session_state.generator = PerformanceReportGenerator()
+    
+    if 'data_loaded' not in st.session_state:
+        st.session_state.data_loaded = False
+    
+    if 'current_period' not in st.session_state:
+        st.session_state.current_period = None
+    
+    if 'metrics' not in st.session_state:
+        st.session_state.metrics = {}
+    
     # Sidebar for configuration
     with st.sidebar:
         st.markdown("### 📅 Date Range Selection")
         
-        # Date range selection
-        date_options = {
-            'Full Period (Oct 2025 - Jan 2026)': (datetime(2025, 10, 1), min(datetime(2026, 1, 14), datetime.now())),
-            'October 2025': (datetime(2025, 10, 1), datetime(2025, 10, 31)),
-            'November 2025': (datetime(2025, 11, 1), datetime(2025, 11, 30)),
-            'December 2025': (datetime(2025, 12, 1), datetime(2025, 12, 31)),
-            'January 2026 Week 1': (datetime(2026, 1, 1), datetime(2026, 1, 7)),
-            'January 2026 Week 2': (datetime(2026, 1, 8), min(datetime(2026, 1, 14), datetime.now())),
-            'Last 7 Days': (datetime.now() - timedelta(days=7), datetime.now()),
-            'Last 30 Days': (datetime.now() - timedelta(days=30), datetime.now())
-        }
+        # Date range selection with better UX
+        col1, col2 = st.columns(2)
+        with col1:
+            start_date = st.date_input(
+                "Start Date",
+                datetime(2025, 10, 1),
+                min_value=datetime(2025, 1, 1),
+                max_value=datetime.now()
+            )
+        with col2:
+            end_date = st.date_input(
+                "End Date",
+                min(datetime(2026, 1, 14), datetime.now()),
+                min_value=datetime(2025, 1, 1),
+                max_value=datetime.now()
+            )
         
-        selected_period = st.selectbox(
-            "Select Period",
-            list(date_options.keys())
-        )
+        start_date = datetime.combine(start_date, datetime.min.time())
+        end_date = datetime.combine(end_date, datetime.max.time())
         
-        # Custom date range option
-        custom_date = st.checkbox("Use Custom Date Range")
+        # Quick date presets
+        st.markdown("#### 🚀 Quick Presets")
+        preset_col1, preset_col2 = st.columns(2)
         
-        if custom_date:
-            col1, col2 = st.columns(2)
-            with col1:
-                start_date = st.date_input("Start Date", datetime(2025, 10, 1))
-            with col2:
-                end_date = st.date_input("End Date", min(datetime(2026, 1, 14), datetime.now()))
-            start_date = datetime.combine(start_date, datetime.min.time())
-            end_date = datetime.combine(end_date, datetime.max.time())
-        else:
-            start_date, end_date = date_options[selected_period]
+        with preset_col1:
+            if st.button("Last 7 Days", width='stretch'):
+                end_date = datetime.now()
+                start_date = end_date - timedelta(days=7)
+                st.rerun()
+            
+            if st.button("This Month", width='stretch'):
+                end_date = datetime.now()
+                start_date = datetime(end_date.year, end_date.month, 1)
+                st.rerun()
+        
+        with preset_col2:
+            if st.button("Last 30 Days", width='stretch'):
+                end_date = datetime.now()
+                start_date = end_date - timedelta(days=30)
+                st.rerun()
+            
+            if st.button("Full Period", width='stretch'):
+                start_date = datetime(2025, 10, 1)
+                end_date = min(datetime(2026, 1, 14), datetime.now())
+                st.rerun()
         
         # Period type selection
         period_type = st.selectbox(
@@ -1095,11 +955,28 @@ def main():
             index=0
         ).lower()
         
-        # Load data button
+        # Load data button with better UX
         st.markdown("---")
-        load_data = st.button("🚀 Load Data & Generate Report", type="primary", use_container_width=True)
+        load_button = st.button(
+            "🚀 Load Data & Generate Report",
+            type="primary",
+            width='stretch'
+        )
         
-        # Database connection info (read-only)
+        if load_button:
+            st.session_state.data_loaded = False
+            st.session_state.current_period = f"{start_date.date()} to {end_date.date()}"
+            st.session_state.metrics = {}
+            st.rerun()
+        
+        # Clear cache button
+        if st.button("🔄 Clear Cache & Refresh", width='stretch'):
+            st.session_state.generator._cache = {}
+            st.session_state.data_loaded = False
+            st.success("Cache cleared!")
+            st.rerun()
+        
+        # Database connection info
         st.markdown("---")
         with st.expander("🔒 Database Connection Info", expanded=False):
             st.info("""
@@ -1125,168 +1002,103 @@ def main():
             - **Weekly/Rolling**: ≥2 transactions in period
             
             **Key Metrics:**
-            - WAU: Weekly Active Users (new customers only)
+            - WAU: Weekly Active Users
             - FTT: First-Time Transactors
             - KYC Rate: Verified customers
             - Net Growth: Customer growth vs previous period
             """)
     
-    # Initialize report generator
-    generator = PerformanceReportGenerator()
-    
     # Main content area
-    if load_data:
-        with st.spinner("Loading data from MySQL..."):
-            success = generator.load_data_from_mysql(start_date, end_date)
+    if st.session_state.data_loaded and st.session_state.metrics:
+        # Display metrics from session state
+        exec_metrics = st.session_state.metrics.get('exec_metrics')
+        cust_acq_metrics = st.session_state.metrics.get('cust_acq_metrics')
+        product_metrics = st.session_state.metrics.get('product_metrics')
+        activity_metrics = st.session_state.metrics.get('activity_metrics')
+        
+        # Display metrics in tabs
+        tab1, tab2, tab3, tab4, tab5 = st.tabs([
+            "📈 Executive Snapshot", 
+            "👥 Customer Acquisition", 
+            "📊 Product Usage", 
+            "📱 Customer Activity",
+            "📥 Export Data"
+        ])
+        
+        with tab1:
+            display_executive_snapshot(exec_metrics, st.session_state.current_period)
+        
+        with tab2:
+            display_customer_acquisition(cust_acq_metrics)
+        
+        with tab3:
+            display_product_usage(product_metrics)
+        
+        with tab4:
+            display_customer_activity(activity_metrics)
+        
+        with tab5:
+            st.markdown("<h3 class='sub-header'>Export Data</h3>", unsafe_allow_html=True)
+            
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                # Export transactions
+                if not st.session_state.generator.transactions.empty:
+                    csv = st.session_state.generator.transactions.to_csv(index=False)
+                    st.download_button(
+                        label="📥 Download Transactions CSV",
+                        data=csv,
+                        file_name=f"transactions_{start_date.date()}_to_{end_date.date()}.csv",
+                        mime="text/csv",
+                        width='stretch'
+                    )
+            
+            with col2:
+                # Export onboarding
+                if not st.session_state.generator.onboarding.empty:
+                    csv = st.session_state.generator.onboarding.to_csv(index=False)
+                    st.download_button(
+                        label="📥 Download Onboarding CSV",
+                        data=csv,
+                        file_name=f"onboarding_{start_date.date()}_to_{end_date.date()}.csv",
+                        mime="text/csv",
+                        width='stretch'
+                    )
+    
+    elif load_button or (st.session_state.current_period and not st.session_state.data_loaded):
+        # Load and calculate data
+        with st.spinner(f"Loading data for {start_date.date()} to {end_date.date()}..."):
+            success = st.session_state.generator.load_data_from_mysql(start_date, end_date)
         
         if success:
-            # Calculate metrics
             with st.spinner("Calculating metrics..."):
-                # Executive Snapshot
-                exec_metrics = generator.calculate_executive_snapshot(start_date, end_date, period_type)
+                # Calculate all metrics
+                exec_metrics = st.session_state.generator.calculate_executive_snapshot(start_date, end_date, period_type)
                 
-                # Customer Acquisition
                 # Calculate previous period for comparison
                 days_diff = (end_date - start_date).days + 1
                 prev_start = start_date - timedelta(days=days_diff)
                 prev_end = start_date - timedelta(seconds=1)
-                cust_acq_metrics = generator.calculate_customer_acquisition(start_date, end_date, prev_start, prev_end)
+                cust_acq_metrics = st.session_state.generator.calculate_customer_acquisition(start_date, end_date, prev_start, prev_end)
                 
-                # Product Usage
-                product_metrics = generator.calculate_product_usage_performance(start_date, end_date, period_type, prev_start, prev_end)
+                product_metrics = st.session_state.generator.calculate_product_usage_performance(start_date, end_date, period_type, prev_start, prev_end)
                 
-                # Customer Activity
-                activity_metrics = generator.calculate_customer_activity_engagement(start_date, end_date, period_type)
-            
-            # Display metrics in tabs
-            tab1, tab2, tab3, tab4, tab5 = st.tabs([
-                "📈 Executive Snapshot", 
-                "👥 Customer Acquisition", 
-                "📊 Product Usage", 
-                "📱 Customer Activity",
-                "📥 Export Data"
-            ])
-            
-            with tab1:
-                display_executive_snapshot(exec_metrics, selected_period)
-            
-            with tab2:
-                display_customer_acquisition(cust_acq_metrics)
-            
-            with tab3:
-                display_product_usage(product_metrics)
-            
-            with tab4:
-                display_customer_activity(activity_metrics)
-            
-            with tab5:
-                st.markdown("<h3 class='sub-header'>Export Data</h3>", unsafe_allow_html=True)
+                activity_metrics = st.session_state.generator.calculate_customer_activity_engagement(start_date, end_date, period_type)
                 
-                col1, col2 = st.columns(2)
-                
-                with col1:
-                    # Export transactions
-                    if not generator.transactions.empty:
-                        csv = generator.transactions.to_csv(index=False)
-                        st.download_button(
-                            label="📥 Download Transactions CSV",
-                            data=csv,
-                            file_name=f"transactions_{start_date.date()}_to_{end_date.date()}.csv",
-                            mime="text/csv",
-                            use_container_width=True
-                        )
-                
-                with col2:
-                    # Export onboarding
-                    if not generator.onboarding.empty:
-                        csv = generator.onboarding.to_csv(index=False)
-                        st.download_button(
-                            label="📥 Download Onboarding CSV",
-                            data=csv,
-                            file_name=f"onboarding_{start_date.date()}_to_{end_date.date()}.csv",
-                            mime="text/csv",
-                            use_container_width=True
-                        )
-                
-                # Export summary report
-                st.markdown("---")
-                st.markdown("### 📊 Export Summary Report")
-                
-                summary_data = {
-                    'Metric': [
-                        'Report Period',
-                        'Start Date',
-                        'End Date',
-                        'Period Type',
-                        'New Customers Total',
-                        'New Customers Active',
-                        'New Customers Registered',
-                        'New Customers Temporary',
-                        'Active Customers',
-                        'WAU Total',
-                        'WAU Active',
-                        'WAU Registered',
-                        'WAU Temporary',
-                        'Net Growth %',
-                        'New Registrations Total',
-                        'KYC Completed',
-                        'First-Time Transactors',
-                        'FTT Rate %',
-                        'Total Transactions',
-                        'Top Product',
-                        'Top Product Transactions',
-                        'Low Product',
-                        'Low Product Transactions',
-                        'Weekly Active Users',
-                        'Avg Transactions per User',
-                        'Avg Products per User'
-                    ],
-                    'Value': [
-                        selected_period,
-                        start_date.strftime('%Y-%m-%d'),
-                        end_date.strftime('%Y-%m-%d'),
-                        period_type,
-                        exec_metrics.get('new_customers_total', 0),
-                        exec_metrics.get('new_customers_active', 0),
-                        exec_metrics.get('new_customers_registered', 0),
-                        exec_metrics.get('new_customers_temporary', 0),
-                        exec_metrics.get('active_customers_all', 0),
-                        exec_metrics.get('wau_total', 0),
-                        exec_metrics.get('wau_active', 0),
-                        exec_metrics.get('wau_registered', 0),
-                        exec_metrics.get('wau_temporary', 0),
-                        f"{exec_metrics.get('net_growth_pct', 0):.1f}%" if exec_metrics.get('net_growth_pct') is not None else "N/A",
-                        cust_acq_metrics.get('new_registrations_total', 0),
-                        cust_acq_metrics.get('kyc_completed', 0),
-                        cust_acq_metrics.get('ftt', 0),
-                        f"{(cust_acq_metrics.get('ftt', 0) / cust_acq_metrics.get('new_registrations_total', 1) * 100) if cust_acq_metrics.get('new_registrations_total', 0) > 0 else 0:.1f}%",
-                        activity_metrics.get('total_transactions', 0),
-                        exec_metrics.get('top_product', 'N/A'),
-                        exec_metrics.get('top_product_count', 0),
-                        exec_metrics.get('low_product', 'N/A'),
-                        exec_metrics.get('low_product_count', 0),
-                        activity_metrics.get('wau', 0),
-                        f"{activity_metrics.get('avg_transactions_per_user', 0):.2f}",
-                        f"{activity_metrics.get('avg_products_per_user', 0):.2f}"
-                    ]
+                # Store in session state
+                st.session_state.metrics = {
+                    'exec_metrics': exec_metrics,
+                    'cust_acq_metrics': cust_acq_metrics,
+                    'product_metrics': product_metrics,
+                    'activity_metrics': activity_metrics
                 }
-                
-                summary_df = pd.DataFrame(summary_data)
-                csv = summary_df.to_csv(index=False)
-                
-                st.download_button(
-                    label="📥 Download Summary Report",
-                    data=csv,
-                    file_name=f"performance_summary_{start_date.date()}_to_{end_date.date()}.csv",
-                    mime="text/csv",
-                    use_container_width=True
-                )
-                
-                # Display summary table
-                st.markdown("### 📋 Summary Preview")
-                st.dataframe(summary_df, hide_index=True, use_container_width=True)
+                st.session_state.data_loaded = True
+            
+            st.success("✅ Data loaded and metrics calculated successfully!")
+            st.rerun()
         else:
-            st.error("Failed to load data. Please check your database connection.")
+            st.error("❌ Failed to load data. Please check your database connection.")
     
     else:
         # Show welcome message
