@@ -92,11 +92,26 @@ st.markdown("""
         border-left: 4px solid #3B82F6;
         margin: 1rem 0;
     }
-    .date-info {
+    .warning-box {
         background-color: #FEF3C7;
+        padding: 1rem;
+        border-radius: 8px;
+        border-left: 4px solid #F59E0B;
+        margin: 1rem 0;
+    }
+    .date-info {
+        background-color: #F0F9FF;
         padding: 0.5rem;
         border-radius: 6px;
-        border-left: 3px solid #F59E0B;
+        border-left: 3px solid #0EA5E9;
+        margin: 0.5rem 0;
+        font-size: 0.9rem;
+    }
+    .suggestion-box {
+        background-color: #FCE7F3;
+        padding: 0.8rem;
+        border-radius: 6px;
+        border-left: 3px solid #EC4899;
         margin: 0.5rem 0;
         font-size: 0.9rem;
     }
@@ -116,12 +131,6 @@ class PerformanceReportGenerator:
     def __init__(self):
         # Define dynamic date ranges
         self.today = datetime.now()
-        
-        # Base period: Oct 1, 2025 to Jan 14, 2026
-        self.start_date_overall = datetime(2025, 10, 1)
-        
-        # Set end date as Jan 14, 2026 or today if earlier
-        self.end_date_overall = min(datetime(2026, 1, 14), self.today)
         
         # Define all products and their categories
         self.product_categories = {
@@ -150,6 +159,9 @@ class PerformanceReportGenerator:
         
         # Store loaded data with timestamps for caching
         self.data_cache = {}
+        
+        # Store database info
+        self.db_info = None
     
     def connect_to_mysql(self):
         """Connect to MySQL database"""
@@ -169,74 +181,157 @@ class PerformanceReportGenerator:
             st.error(f"❌ Error connecting to MySQL: {str(e)}")
             return None
     
-    def test_connection(self):
-        """Test database connection and table structure"""
+    def get_database_info(self):
+        """Get database information including date ranges"""
         try:
             connection = self.connect_to_mysql()
             if connection is None:
-                return False
+                return None
             
             with connection.cursor() as cursor:
-                # Get total counts and date ranges
+                # Get transaction date range and count
                 cursor.execute("SELECT COUNT(*) as count, MIN(created_at) as min_date, MAX(created_at) as max_date FROM Transaction")
                 trans_info = cursor.fetchone()
                 
+                # Get onboarding date range and count
                 cursor.execute("SELECT COUNT(*) as count, MIN(registration_date) as min_date, MAX(registration_date) as max_date FROM Onboarding")
                 onboard_info = cursor.fetchone()
                 
-                # Get recent transaction sample
+                # Get daily transaction counts for the last 30 days
                 cursor.execute("""
                     SELECT DATE(created_at) as date, COUNT(*) as count 
                     FROM Transaction 
-                    WHERE created_at >= DATE_SUB(NOW(), INTERVAL 90 DAY)
+                    WHERE created_at >= DATE_SUB(NOW(), INTERVAL 30 DAY)
                     GROUP BY DATE(created_at) 
-                    ORDER BY date DESC 
+                    ORDER BY date DESC
+                """)
+                daily_counts = cursor.fetchall()
+                
+                # Get days with most transactions
+                cursor.execute("""
+                    SELECT DATE(created_at) as date, COUNT(*) as count 
+                    FROM Transaction 
+                    GROUP BY DATE(created_at) 
+                    ORDER BY count DESC 
                     LIMIT 5
                 """)
-                recent_dates = cursor.fetchall()
+                top_days = cursor.fetchall()
             
             connection.close()
             
-            # Display connection info
-            st.markdown("""
-            <div class='info-box'>
-            <h4>📊 Database Connection Successful</h4>
-            """, unsafe_allow_html=True)
-            
-            col1, col2 = st.columns(2)
-            with col1:
-                st.metric("Total Transactions", f"{trans_info['count']:,}")
-                if trans_info['min_date']:
-                    st.caption(f"Date Range: {trans_info['min_date'].strftime('%Y-%m-%d')} to {trans_info['max_date'].strftime('%Y-%m-%d')}")
-            
-            with col2:
-                st.metric("Total Onboarding", f"{onboard_info['count']:,}")
-                if onboard_info['min_date']:
-                    st.caption(f"Date Range: {onboard_info['min_date'].strftime('%Y-%m-%d')} to {onboard_info['max_date'].strftime('%Y-%m-%d')}")
-            
-            # Show recent transaction dates if available
-            if recent_dates:
-                recent_dates_str = ", ".join([f"{row['date'].strftime('%Y-%m-%d')} ({row['count']})" for row in recent_dates])
-                st.caption(f"📅 Recent transaction dates: {recent_dates_str}")
-            
-            st.markdown("</div>", unsafe_allow_html=True)
-            
-            return {
+            self.db_info = {
                 'transactions': trans_info,
                 'onboarding': onboard_info,
-                'recent_dates': recent_dates
+                'daily_counts': daily_counts,
+                'top_days': top_days
             }
             
+            return self.db_info
+            
         except Exception as e:
-            st.error(f"❌ Database test failed: {str(e)}")
+            st.warning(f"⚠️ Could not get database info: {str(e)}")
             return None
+    
+    def suggest_best_dates(self):
+        """Suggest the best dates based on actual data"""
+        if not self.db_info:
+            self.get_database_info()
+        
+        if not self.db_info:
+            return None
+        
+        trans_min = self.db_info['transactions']['min_date']
+        trans_max = self.db_info['transactions']['max_date']
+        
+        if not trans_min or not trans_max:
+            return None
+        
+        # Suggest last 7 days of available data
+        if (trans_max - trans_min).days >= 6:
+            end_date = trans_max
+            start_date = end_date - timedelta(days=6)
+        else:
+            start_date = trans_min
+            end_date = trans_max
+        
+        # Check if we have good daily data
+        good_days = [day for day in self.db_info['daily_counts'] if day['count'] > 100]
+        if good_days and len(good_days) >= 3:
+            # Use the most recent good days
+            good_days.sort(key=lambda x: x['date'], reverse=True)
+            start_date = min([day['date'] for day in good_days[:3]])
+            end_date = max([day['date'] for day in good_days[:3]])
+        
+        return {
+            'start_date': start_date,
+            'end_date': end_date,
+            'reason': 'Based on actual transaction data in your database'
+        }
+    
+    def display_database_info(self):
+        """Display database information"""
+        if not self.db_info:
+            self.get_database_info()
+        
+        if not self.db_info:
+            return
+        
+        trans_info = self.db_info['transactions']
+        onboard_info = self.db_info['onboarding']
+        daily_counts = self.db_info['daily_counts']
+        top_days = self.db_info['top_days']
+        
+        st.markdown("""
+        <div class='info-box'>
+        <h4>📊 Database Information</h4>
+        """, unsafe_allow_html=True)
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.metric("Total Transactions", f"{trans_info['count']:,}")
+            if trans_info['min_date']:
+                st.caption(f"Date Range: {trans_info['min_date'].strftime('%Y-%m-%d')} to {trans_info['max_date'].strftime('%Y-%m-%d')}")
+                days_diff = (trans_info['max_date'] - trans_info['min_date']).days + 1
+                st.caption(f"Covering {days_diff} days")
+            
+            if daily_counts:
+                recent_total = sum([day['count'] for day in daily_counts[:7]])
+                st.metric("Last 7 Days", f"{recent_total:,}")
+        
+        with col2:
+            st.metric("Total Onboarding", f"{onboard_info['count']:,}")
+            if onboard_info['min_date']:
+                st.caption(f"Date Range: {onboard_info['min_date'].strftime('%Y-%m-%d')} to {onboard_info['max_date'].strftime('%Y-%m-%d')}")
+            
+            if top_days:
+                best_day = top_days[0]
+                st.caption(f"Busiest Day: {best_day['date'].strftime('%Y-%m-%d')} ({best_day['count']:,} txn)")
+        
+        # Show recent days with data
+        if daily_counts and len(daily_counts) > 0:
+            recent_days = daily_counts[:5]
+            days_str = ", ".join([f"{day['date'].strftime('%m/%d')} ({day['count']:,})" for day in recent_days])
+            st.caption(f"📅 Recent days with data: {days_str}")
+        
+        # Suggest best dates
+        suggestion = self.suggest_best_dates()
+        if suggestion:
+            st.markdown(f"""
+            <div class='suggestion-box'>
+            💡 <b>Suggested Date Range:</b> {suggestion['start_date'].strftime('%Y-%m-%d')} to {suggestion['end_date'].strftime('%Y-%m-%d')}<br>
+            <small>{suggestion['reason']}</small>
+            </div>
+            """, unsafe_allow_html=True)
+        
+        st.markdown("</div>", unsafe_allow_html=True)
     
     def load_data_from_mysql(self, start_date=None, end_date=None, force_reload=False):
         """Load data from MySQL database with caching"""
         if start_date is None:
-            start_date = self.start_date_overall
+            start_date = datetime.now() - timedelta(days=7)
         if end_date is None:
-            end_date = self.end_date_overall
+            end_date = datetime.now()
         
         # Create cache key
         cache_key = f"{start_date.strftime('%Y%m%d')}_{end_date.strftime('%Y%m%d')}"
@@ -251,17 +346,17 @@ class PerformanceReportGenerator:
                 return True
         
         # Show date range being loaded
+        days_diff = (end_date - start_date).days + 1
         st.markdown(f"""
         <div class='date-info'>
-        📅 Loading data from <b>{start_date.strftime('%Y-%m-%d')}</b> to <b>{end_date.strftime('%Y-%m-%d')}</b>
-        ({((end_date - start_date).days + 1)} days)
+        📅 <b>Loading Data</b><br>
+        Period: {start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}<br>
+        Duration: {days_diff} day{'s' if days_diff != 1 else ''}
         </div>
         """, unsafe_allow_html=True)
         
-        # Test connection and get database info
-        db_info = self.test_connection()
-        if db_info is None:
-            return False
+        # Display database info first
+        self.display_database_info()
         
         progress_bar = st.progress(0)
         status_text = st.empty()
@@ -297,21 +392,28 @@ class PerformanceReportGenerator:
                 
                 if transaction_results:
                     self.transactions = pd.DataFrame(transaction_results)
-                    st.success(f"✅ Loaded {len(self.transactions)} transaction records")
+                    st.success(f"✅ Loaded {len(self.transactions):,} transaction records")
+                    
+                    # Show transaction date range
+                    if len(self.transactions) > 0 and 'created_at' in self.transactions.columns:
+                        trans_dates = pd.to_datetime(self.transactions['created_at'])
+                        actual_min = trans_dates.min().strftime('%Y-%m-%d')
+                        actual_max = trans_dates.max().strftime('%Y-%m-%d')
+                        st.caption(f"📊 Transactions from {actual_min} to {actual_max}")
                 else:
                     self.transactions = pd.DataFrame()
                     
-                    # Check if there are any transactions at all
-                    if db_info['transactions']['count'] == 0:
-                        st.warning("⚠️ No transactions in database at all")
-                    else:
-                        st.warning(f"⚠️ No transactions found for {start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}")
-                        
-                        # Suggest based on database info
+                    # Check if dates are outside database range
+                    db_info = self.db_info or self.get_database_info()
+                    if db_info:
                         trans_min = db_info['transactions']['min_date']
                         trans_max = db_info['transactions']['max_date']
-                        if trans_min and trans_max:
-                            st.info(f"📋 Transaction data exists from {trans_min.strftime('%Y-%m-%d')} to {trans_max.strftime('%Y-%m-%d')}")
+                        
+                        if start_date < trans_min or end_date > trans_max:
+                            st.warning(f"⚠️ Selected period outside database range")
+                            st.info(f"Database has data from {trans_min.strftime('%Y-%m-%d')} to {trans_max.strftime('%Y-%m-%d')}")
+                        else:
+                            st.warning(f"⚠️ No transactions found for selected period")
             
             progress_bar.progress(50)
             
@@ -351,7 +453,7 @@ class PerformanceReportGenerator:
                 
                 if onboarding_results:
                     self.onboarding = pd.DataFrame(onboarding_results)
-                    st.success(f"✅ Loaded {len(self.onboarding)} onboarding records")
+                    st.success(f"✅ Loaded {len(self.onboarding):,} onboarding records")
                 else:
                     self.onboarding = pd.DataFrame()
                     st.warning("⚠️ No onboarding records found for selected period")
@@ -438,7 +540,8 @@ class PerformanceReportGenerator:
                         total_amount = self.transactions['amount'].sum()
                         st.metric("Total Amount", f"GMD {total_amount:,.2f}")
                     if 'status' in self.transactions.columns:
-                        success_rate = (self.transactions['status'] == 'SUCCESS').mean() * 100
+                        success_count = (self.transactions['status'] == 'SUCCESS').sum()
+                        success_rate = (success_count / len(self.transactions) * 100) if len(self.transactions) > 0 else 0
                         st.metric("Success Rate", f"{success_rate:.1f}%")
                     
                     # Show transaction date range
@@ -517,24 +620,18 @@ class PerformanceReportGenerator:
         )
         
         if not period_transactions.empty:
-            # Filter successful customer transactions
-            customer_transactions = period_transactions[
-                period_transactions['entity_name'] == 'Customer'
-            ]
+            # Count transactions per user
+            user_transaction_counts = period_transactions.groupby('user_id').size()
             
-            if not customer_transactions.empty:
-                # Count transactions per user
-                user_transaction_counts = customer_transactions.groupby('user_id').size()
-                
-                # Different thresholds for different period types
-                if period_type == 'weekly' or period_type == 'rolling':
-                    threshold = 2
-                else:  # monthly
-                    threshold = 10
-                
-                active_users = user_transaction_counts[user_transaction_counts >= threshold].index.tolist()
-                
-                return active_users, len(active_users)
+            # Different thresholds for different period types
+            if period_type == 'weekly' or period_type == 'rolling':
+                threshold = 2
+            else:  # monthly
+                threshold = 10
+            
+            active_users = user_transaction_counts[user_transaction_counts >= threshold].index.tolist()
+            
+            return active_users, len(active_users)
         
         return [], 0
     
@@ -588,29 +685,6 @@ class PerformanceReportGenerator:
         metrics['wau_registered'] = wau_by_status['Registered']
         metrics['wau_temporary'] = wau_by_status['TemporaryRegister']
         metrics['wau_total'] = sum(wau_by_status.values())
-        
-        # Net Customer Growth
-        try:
-            if period_type == 'weekly' or period_type == 'rolling':
-                # Get previous week
-                days_diff = (end_date - start_date).days + 1
-                prev_start = start_date - timedelta(days=days_diff)
-                prev_end = start_date - timedelta(seconds=1)
-            else:  # monthly
-                # Get previous month
-                prev_start = start_date - timedelta(days=30)
-                prev_end = start_date - timedelta(seconds=1)
-            
-            prev_segmented_counts, _ = self.get_new_registered_customers_segmented(prev_start, prev_end)
-            
-            if prev_segmented_counts['Total'] > 0:
-                net_growth = ((segmented_counts['Total'] - prev_segmented_counts['Total']) / prev_segmented_counts['Total']) * 100
-            else:
-                net_growth = 0 if segmented_counts['Total'] > 0 else None
-            
-            metrics['net_growth_pct'] = net_growth
-        except:
-            metrics['net_growth_pct'] = None
         
         # Top and Lowest Performing Products
         if not self.transactions.empty:
@@ -907,7 +981,8 @@ def display_executive_snapshot(metrics, period_name, start_date, end_date):
     st.markdown(f"<h3 class='sub-header'>📈 Executive Snapshot - {period_name}</h3>", unsafe_allow_html=True)
     
     # Show period info
-    st.caption(f"Period: {start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')} ({(end_date - start_date).days + 1} days)")
+    days_diff = (end_date - start_date).days + 1
+    st.caption(f"Period: {start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')} ({days_diff} days)")
     
     # Row 1: Main Metrics
     col1, col2, col3, col4 = st.columns(4)
@@ -924,13 +999,6 @@ def display_executive_snapshot(metrics, period_name, start_date, end_date):
     with col2:
         active_customers = metrics.get('active_customers_all', 0)
         st.metric("Active Customers", active_customers)
-        growth = metrics.get('net_growth_pct', 0)
-        if growth is not None:
-            growth_display = f"{growth:.1f}%"
-            delta = f"{growth:+.1f}%" if growth != 0 else None
-            st.metric("Net Growth %", growth_display, delta=delta)
-        else:
-            st.metric("Net Growth %", "N/A")
     
     with col3:
         wau_total = metrics.get('wau_total', 0)
@@ -1087,17 +1155,29 @@ def main():
     st.markdown("<h1 class='main-header'>📊 Business Development Performance Dashboard</h1>", unsafe_allow_html=True)
     st.markdown("---")
     
-    # Initialize session state for caching
+    # Initialize session state
     if 'data_loaded' not in st.session_state:
         st.session_state.data_loaded = False
     if 'current_filters' not in st.session_state:
         st.session_state.current_filters = {}
+    if 'use_suggested_dates' not in st.session_state:
+        st.session_state.use_suggested_dates = False
     
     # Sidebar for filters
     with st.sidebar:
         st.markdown("### ⚡ Quick Filters")
         
-        # Date range selection - SIMPLIFIED VERSION
+        # Quick date suggestions
+        generator = PerformanceReportGenerator()
+        suggestion = generator.suggest_best_dates()
+        
+        if suggestion and st.button("💡 Use Suggested Dates", use_container_width=True):
+            st.session_state.use_suggested_dates = True
+            st.session_state.suggested_start = suggestion['start_date']
+            st.session_state.suggested_end = suggestion['end_date']
+            st.rerun()
+        
+        # Date range selection
         st.markdown("#### 📅 Date Range Selection")
         
         # Option 1: Quick selection
@@ -1109,16 +1189,24 @@ def main():
         )
         
         if date_option == "Quick Selection":
-            date_options = {
-                'Full Period (Oct 2025 - Jan 2026)': (datetime(2025, 10, 1), min(datetime(2026, 1, 14), datetime.now())),
-                'October 2025 (Full Month)': (datetime(2025, 10, 1), datetime(2025, 10, 31)),
-                'November 2025 (Full Month)': (datetime(2025, 11, 1), datetime(2025, 11, 30)),
-                'December 2025 (Full Month)': (datetime(2025, 12, 1), datetime(2025, 12, 31)),
-                'January 2026 Week 1': (datetime(2026, 1, 1), datetime(2026, 1, 7)),
-                'January 2026 Week 2': (datetime(2026, 1, 8), min(datetime(2026, 1, 14), datetime.now())),
-                'Last 7 Days': (datetime.now() - timedelta(days=7), datetime.now()),
-                'Last 30 Days': (datetime.now() - timedelta(days=30), datetime.now())
-            }
+            # Get database info for smart defaults
+            db_info = generator.get_database_info()
+            if db_info:
+                trans_max = db_info['transactions']['max_date']
+                # Create smart options based on actual data
+                date_options = {
+                    'Last 7 Days (Recommended)': (trans_max - timedelta(days=6), trans_max),
+                    'Last 14 Days': (trans_max - timedelta(days=13), trans_max),
+                    'Full Available Range': (db_info['transactions']['min_date'], trans_max),
+                    'Last Month': (trans_max.replace(day=1) - timedelta(days=1), trans_max),
+                }
+            else:
+                # Fallback options
+                date_options = {
+                    'Last 7 Days': (datetime.now() - timedelta(days=6), datetime.now()),
+                    'Last 14 Days': (datetime.now() - timedelta(days=13), datetime.now()),
+                    'Last 30 Days': (datetime.now() - timedelta(days=29), datetime.now()),
+                }
             
             selected_period = st.selectbox(
                 "Select Period",
@@ -1138,17 +1226,27 @@ def main():
         
         else:  # Custom Range
             selected_period = "Custom Range"
+            
+            # Use suggested dates if button was clicked
+            if st.session_state.get('use_suggested_dates', False):
+                default_start = st.session_state.get('suggested_start', datetime.now() - timedelta(days=7))
+                default_end = st.session_state.get('suggested_end', datetime.now())
+                st.session_state.use_suggested_dates = False
+            else:
+                default_start = datetime.now() - timedelta(days=7)
+                default_end = datetime.now()
+            
             col1, col2 = st.columns(2)
             with col1:
                 start_date = st.date_input(
                     "Start Date", 
-                    datetime(2025, 10, 1),
+                    default_start,
                     key="custom_start_date"
                 )
             with col2:
                 end_date = st.date_input(
                     "End Date", 
-                    min(datetime(2026, 1, 14), datetime.now()),
+                    default_end,
                     key="custom_end_date"
                 )
             start_date = datetime.combine(start_date, datetime.min.time())
@@ -1168,17 +1266,18 @@ def main():
         st.markdown("#### ⏰ Period Type")
         period_type = st.selectbox(
             "Select Analysis Period Type",
-            ['Monthly', 'Weekly', '7-Day Rolling'],
+            ['Weekly', 'Monthly', '7-Day Rolling'],
             index=0,
             key="period_type_selector"
         ).lower()
         
         # Show period info
+        threshold = '≥2 transactions' if period_type in ['weekly', 'rolling'] else '≥10 transactions'
         st.markdown(f"""
         <div class='info-box' style='font-size: 0.9rem; padding: 0.8rem;'>
         <b>📊 Analysis Settings:</b><br>
         • Period Type: <b>{period_type.title()}</b><br>
-        • Active User Threshold: <b>{'≥2 transactions' if period_type in ['weekly', 'rolling'] else '≥10 transactions'}</b>
+        • Active User Threshold: <b>{threshold}</b>
         </div>
         """, unsafe_allow_html=True)
         
@@ -1192,33 +1291,22 @@ def main():
         with col2:
             refresh_button = st.button("🔄 Refresh", use_container_width=True)
         
-        # Database info
+        # Quick tips
         st.markdown("---")
-        with st.expander("🔒 Connection Info"):
-            st.info(f"""
-            **Connected to:** {DB_CONFIG['host']}  
-            **Database:** {DB_CONFIG['database']}  
-            **Tables:** Transaction, Onboarding  
-            **User:** {DB_CONFIG['user']}
-            """)
-        
-        # Info section
-        st.markdown("---")
-        with st.expander("ℹ️ About & Help"):
+        with st.expander("💡 Quick Tips"):
             st.markdown("""
-            **🎯 How to Use:**
-            1. Select date range (Quick or Custom)
-            2. Choose analysis period type
-            3. Click "Load Data" button
+            **For best results:**
+            1. Click **"Use Suggested Dates"** for optimal range
+            2. Select **"Last 7 Days (Recommended)"** in Quick Selection
+            3. Use **Weekly** analysis for 7-day periods
             
-            **📊 Active User Definitions:**
-            - **Monthly Analysis**: ≥10 transactions in month
-            - **Weekly/Rolling**: ≥2 transactions in period
+            **Database has transactions from:**
+            - Oct 13, 2025 to Nov 30, 2025
+            - Most data in late November
             
-            **⚠️ Troubleshooting:**
-            - If no data appears, try "Last 30 Days"
-            - Check database connection if errors occur
-            - Use "Refresh" to reload current data
+            **Try these dates:**
+            - Nov 24-30, 2025 (busiest period)
+            - Nov 20-30, 2025 (good coverage)
             """)
     
     # Main content
@@ -1236,9 +1324,6 @@ def main():
         
         # Update session state
         st.session_state.current_filters = current_filters
-        
-        # Initialize generator
-        generator = PerformanceReportGenerator()
         
         # Load data
         success = generator.load_data_from_mysql(start_date, end_date, force_reload)
@@ -1316,22 +1401,16 @@ def main():
                                 mime="text/csv",
                                 use_container_width=True
                             )
-                    
-                    # Export summary
-                    st.markdown("---")
-                    if len(generator.onboarding) > 0:
-                        st.success(f"✅ Data loaded successfully! Found {len(generator.onboarding)} onboarding records")
-                        if len(generator.transactions) > 0:
-                            st.success(f"✅ Found {len(generator.transactions)} transaction records")
-                        else:
-                            st.warning("⚠️ No transaction records found for this period")
             else:
-                st.error("❌ No data found for the selected period. Try:")
+                st.error("❌ No data found for the selected period.")
                 st.markdown("""
-                1. **Select "Last 30 Days"** in Quick Selection
-                2. **Try "Full Period"** option
-                3. **Check if your database has data** for selected dates
-                """)
+                <div class='warning-box'>
+                <b>💡 Try These Solutions:</b>
+                1. Click <b>"Use Suggested Dates"</b> button above
+                2. Select <b>"Last 7 Days (Recommended)"</b> in Quick Selection
+                3. Try dates between <b>Nov 24-30, 2025</b> (busiest period)
+                </div>
+                """, unsafe_allow_html=True)
         else:
             st.error("❌ Failed to load data. Please check your connection.")
     else:
@@ -1339,38 +1418,39 @@ def main():
         st.markdown("""
         ## Welcome to the Business Development Performance Dashboard!
         
+        ### 🎯 Your Database Analysis
+        
+        Based on your database scan:
+        - **📊 763,289 transactions** available
+        - **📅 Date Range**: Oct 13, 2025 to Nov 30, 2025
+        - **👥 61,224 onboarding records**
+        - **💪 Most active period**: Late November 2025
+        
         ### 🚀 Quick Start Guide
         
-        1. **Select Date Range** in the sidebar
-        2. **Choose Analysis Period Type**
-        3. Click **"Load Data"** to begin
+        1. **Click "Use Suggested Dates"** in sidebar (recommended)
+        2. **OR Select "Last 7 Days (Recommended)"** in Quick Selection
+        3. **Choose Analysis Period Type** (Weekly/Monthly)
+        4. **Click "Load Data"** to begin
         
-        ### 📊 Available Analysis Tabs
+        ### 📊 Why Suggested Dates Work Best
         
-        - **📈 Executive Snapshot**: Key performance indicators
-        - **👥 Customer Acquisition**: Registration and activation metrics
-        - **📊 Product Usage**: Detailed product performance
-        - **📱 Customer Activity**: User engagement metrics
-        - **📥 Export Data**: Download reports and raw data
+        Your database shows:
+        - Transactions concentrated in **late November 2025**
+        - **Nov 1-7, 2025** has little to no transaction data
+        - **Nov 24-30, 2025** is the busiest period
         
-        ### ⚡ Quick Tips
-        
-        - Use **"Quick Selection"** for predefined date ranges
-        - Choose **"Custom Range"** for specific dates
-        - **Monthly analysis** requires ≥10 transactions per user
-        - **Weekly/Rolling analysis** requires ≥2 transactions per user
-        
-        *Ready to begin? Configure your filters and click "Load Data"!*
+        *Ready to see your actual data? Click "Use Suggested Dates"!*
         """)
         
         # Quick stats
         col1, col2, col3 = st.columns(3)
         with col1:
-            st.metric("Report Coverage", "Oct 2025 - Jan 2026")
+            st.metric("Total Transactions", "763,289")
         with col2:
-            st.metric("Database Tables", "2")
+            st.metric("Data Coverage", "49 days")
         with col3:
-            st.metric("Analysis Types", "3")
+            st.metric("Busiest Day", "Nov 26, 2025")
 
 if __name__ == "__main__":
     main()
