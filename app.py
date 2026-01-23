@@ -95,6 +95,13 @@ st.markdown("""
         border-radius: 4px;
         margin: 1rem 0;
     }
+    .info-box {
+        background-color: #DBEAFE;
+        border-left: 4px solid #3B82F6;
+        padding: 1rem;
+        border-radius: 4px;
+        margin: 1rem 0;
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -172,22 +179,6 @@ class PerformanceDashboard:
                 return False
         return False
     
-    def get_table_structure(self, table_name):
-        """Get table structure to debug column names"""
-        connection = self.get_db_connection()
-        if not connection:
-            return None
-        
-        try:
-            with connection.cursor() as cursor:
-                cursor.execute(f"SHOW COLUMNS FROM {table_name}")
-                columns = cursor.fetchall()
-                connection.close()
-                return [col['Field'] for col in columns]
-        except Exception as e:
-            st.error(f"Error getting table structure for {table_name}: {e}")
-            return None
-    
     def load_data_from_db(self, start_date, end_date):
         """Load data from MySQL database"""
         st.session_state.start_date = start_date
@@ -199,121 +190,90 @@ class PerformanceDashboard:
         
         try:
             with connection.cursor() as cursor:
-                # First, check what tables exist
-                cursor.execute("SHOW TABLES")
-                tables = cursor.fetchall()
-                table_list = [list(table.values())[0] for table in tables]
-                st.info(f"Available tables: {', '.join(table_list)}")
+                # Load transactions
+                st.info("Loading transaction data...")
                 
-                # Load transactions - check if table exists
-                if 'Transaction' not in table_list and 'transaction' not in table_list:
-                    st.warning("⚠️ Transaction table not found in database")
-                    st.session_state.transactions = pd.DataFrame()
+                transaction_query = """
+                    SELECT 
+                        id, user_identifier, transaction_id, sub_transaction_id,
+                        entity_name, full_name, created_by, status, internal_status,
+                        service_name, product_name, transaction_type, amount,
+                        before_balance, after_balance, ucp_name, wallet_name,
+                        pouch_name, reference, error_code, error_message,
+                        vendor_transaction_id, vendor_response_code, vendor_message,
+                        slug, remarks, created_at, business_hierarchy,
+                        parent_user_identifier, parent_full_name
+                    FROM Transaction
+                    WHERE created_at BETWEEN %s AND %s
+                    ORDER BY created_at
+                """
+                
+                cursor.execute(transaction_query, (start_date, end_date))
+                transactions = cursor.fetchall()
+                
+                # Convert to DataFrame
+                if transactions:
+                    transactions_df = pd.DataFrame(transactions)
+                    
+                    # Parse dates
+                    if 'created_at' in transactions_df.columns:
+                        transactions_df['created_at'] = pd.to_datetime(transactions_df['created_at'], errors='coerce')
+                    
+                    # Clean numeric columns
+                    if 'amount' in transactions_df.columns:
+                        transactions_df['amount'] = pd.to_numeric(transactions_df['amount'], errors='coerce')
+                    
+                    # Clean text columns
+                    text_cols = ['user_identifier', 'product_name', 'entity_name', 'transaction_type', 
+                               'ucp_name', 'service_name', 'status']
+                    for col in text_cols:
+                        if col in transactions_df.columns:
+                            transactions_df[col] = transactions_df[col].astype(str).str.strip()
+                    
+                    st.session_state.transactions = transactions_df
+                    st.success(f"✅ Loaded {len(transactions_df)} transaction records")
                 else:
-                    # Get table structure to debug
-                    table_structure = self.get_table_structure('Transaction')
-                    if table_structure:
-                        st.info(f"Transaction table columns: {', '.join(table_structure)}")
-                    
-                    st.info("Loading transaction data...")
-                    
-                    # Use the correct column name from your sample
-                    transaction_query = """
-                        SELECT 
-                            id, user_identifier, transaction_id, sub_transaction_id,
-                            entity_name, full_name, created_by, status, internal_status,
-                            service_name, product_name, transaction_type, amount,
-                            before_balance, after_balance, ucp_name, wallet_name,
-                            pouch_name, reference, error_code, error_message,
-                            vendor_transaction_id, vendor_response_code, vendor_message,
-                            slug, remarks, created_at, business_hierarchy,
-                            parent_user_identifier, parent_full_name
-                        FROM Transaction
-                        WHERE created_at BETWEEN %s AND %s
-                        ORDER BY created_at
-                    """
-                    
-                    cursor.execute(transaction_query, (start_date, end_date))
-                    transactions = cursor.fetchall()
-                    
-                    # Convert to DataFrame
-                    if transactions:
-                        transactions_df = pd.DataFrame(transactions)
-                        # Debug: Show column names
-                        st.info(f"Transaction columns loaded: {list(transactions_df.columns)}")
-                        
-                        # Parse dates - use created_at from sample data
-                        if 'created_at' in transactions_df.columns:
-                            transactions_df['created_at'] = pd.to_datetime(transactions_df['created_at'], errors='coerce')
-                        elif 'Created At' in transactions_df.columns:
-                            transactions_df['created_at'] = pd.to_datetime(transactions_df['Created At'], errors='coerce')
-                        
-                        # Clean numeric columns
-                        if 'amount' in transactions_df.columns:
-                            transactions_df['amount'] = pd.to_numeric(transactions_df['amount'], errors='coerce')
-                        
-                        # Clean text columns
-                        text_cols = ['user_identifier', 'product_name', 'entity_name', 'transaction_type', 
-                                   'ucp_name', 'service_name', 'status']
-                        for col in text_cols:
-                            if col in transactions_df.columns:
-                                transactions_df[col] = transactions_df[col].astype(str).str.strip()
-                        
-                        st.session_state.transactions = transactions_df
-                        st.success(f"✅ Loaded {len(transactions_df)} transaction records")
-                    else:
-                        st.warning("⚠️ No transaction records found in the selected date range")
-                        st.session_state.transactions = pd.DataFrame()
+                    st.warning("⚠️ No transaction records found in the selected date range")
+                    st.session_state.transactions = pd.DataFrame()
                 
                 # Load onboarding data
-                if 'Onboarding' not in table_list and 'onboarding' not in table_list:
-                    st.warning("⚠️ Onboarding table not found in database")
-                    st.session_state.onboarding = pd.DataFrame()
+                st.info("Loading onboarding data...")
+                
+                onboarding_query = """
+                    SELECT 
+                        account_id, full_name, mobile, email, region, district,
+                        town_village, business_name, kyc_status, registration_date,
+                        updated_at, proof_of_id, identification_number,
+                        customer_referrer_code, customer_referrer_mobile,
+                        referrer_entity, entity, bank, bank_account_name,
+                        bank_account_number, status
+                    FROM Onboarding
+                    WHERE registration_date BETWEEN %s AND %s
+                    ORDER BY registration_date
+                """
+                
+                cursor.execute(onboarding_query, (start_date, end_date))
+                onboarding = cursor.fetchall()
+                
+                if onboarding:
+                    onboarding_df = pd.DataFrame(onboarding)
+                    
+                    # Parse dates
+                    if 'registration_date' in onboarding_df.columns:
+                        onboarding_df['registration_date'] = pd.to_datetime(onboarding_df['registration_date'], errors='coerce')
+                    
+                    if 'updated_at' in onboarding_df.columns:
+                        onboarding_df['updated_at'] = pd.to_datetime(onboarding_df['updated_at'], errors='coerce')
+                    
+                    # Create User Identifier for merging
+                    if 'mobile' in onboarding_df.columns:
+                        onboarding_df['user_identifier'] = onboarding_df['mobile'].astype(str).str.strip()
+                    
+                    st.session_state.onboarding = onboarding_df
+                    st.success(f"✅ Loaded {len(onboarding_df)} onboarding records")
                 else:
-                    st.info("Loading onboarding data...")
-                    
-                    # Get table structure to debug
-                    table_structure = self.get_table_structure('Onboarding')
-                    if table_structure:
-                        st.info(f"Onboarding table columns: {', '.join(table_structure)}")
-                    
-                    onboarding_query = """
-                        SELECT 
-                            account_id, full_name, mobile, email, region, district,
-                            town_village, business_name, kyc_status, registration_date,
-                            updated_at, proof_of_id, identification_number,
-                            customer_referrer_code, customer_referrer_mobile,
-                            referrer_entity, entity, bank, bank_account_name,
-                            bank_account_number, status
-                        FROM Onboarding
-                        WHERE registration_date BETWEEN %s AND %s
-                        ORDER BY registration_date
-                    """
-                    
-                    cursor.execute(onboarding_query, (start_date, end_date))
-                    onboarding = cursor.fetchall()
-                    
-                    if onboarding:
-                        onboarding_df = pd.DataFrame(onboarding)
-                        # Debug: Show column names
-                        st.info(f"Onboarding columns loaded: {list(onboarding_df.columns)}")
-                        
-                        # Parse dates
-                        if 'registration_date' in onboarding_df.columns:
-                            onboarding_df['registration_date'] = pd.to_datetime(onboarding_df['registration_date'], errors='coerce')
-                        
-                        if 'updated_at' in onboarding_df.columns:
-                            onboarding_df['updated_at'] = pd.to_datetime(onboarding_df['updated_at'], errors='coerce')
-                        
-                        # Create User Identifier for merging
-                        if 'mobile' in onboarding_df.columns:
-                            onboarding_df['user_identifier'] = onboarding_df['mobile'].astype(str).str.strip()
-                        
-                        st.session_state.onboarding = onboarding_df
-                        st.success(f"✅ Loaded {len(onboarding_df)} onboarding records")
-                    else:
-                        st.warning("⚠️ No onboarding records found in the selected date range")
-                        st.session_state.onboarding = pd.DataFrame()
+                    st.warning("⚠️ No onboarding records found in the selected date range")
+                    st.session_state.onboarding = pd.DataFrame()
             
             connection.close()
             st.session_state.data_loaded = True
@@ -346,7 +306,7 @@ class PerformanceDashboard:
         selected_option = st.sidebar.selectbox(
             "Select Date Range",
             list(date_options.keys()),
-            index=1
+            index=2  # Default to Last 90 Days
         )
         
         today = datetime.now()
@@ -356,7 +316,7 @@ class PerformanceDashboard:
             with col1:
                 start_date = st.date_input(
                     "Start Date",
-                    value=today - timedelta(days=30),
+                    value=today - timedelta(days=90),
                     max_value=today
                 )
             with col2:
@@ -366,43 +326,52 @@ class PerformanceDashboard:
                     min_value=start_date,
                     max_value=today
                 )
+            start_datetime = datetime.combine(start_date, datetime.min.time())
+            end_datetime = datetime.combine(end_date, datetime.max.time())
+            
         else:
             days = date_options[selected_option]
             
             if days == "month":
-                start_date = today.replace(day=1)
-                end_date = today
+                # This month
+                start_datetime = today.replace(day=1)
+                end_datetime = today
             elif days == "last_month":
-                first_day = (today.replace(day=1) - timedelta(days=1)).replace(day=1)
-                last_day = today.replace(day=1) - timedelta(days=1)
-                start_date = first_day
-                end_date = last_day
+                # Previous month
+                if today.month == 1:
+                    start_datetime = datetime(today.year - 1, 12, 1)
+                else:
+                    start_datetime = datetime(today.year, today.month - 1, 1)
+                end_datetime = start_datetime + relativedelta(months=1, days=-1)
             elif days == "quarter":
+                # This quarter
                 current_quarter = (today.month - 1) // 3 + 1
-                start_date = datetime(today.year, 3 * current_quarter - 2, 1)
-                end_date = today
+                start_month = 3 * current_quarter - 2
+                start_datetime = datetime(today.year, start_month, 1)
+                end_datetime = today
             elif days == "last_quarter":
+                # Previous quarter
                 current_quarter = (today.month - 1) // 3 + 1
                 last_quarter = current_quarter - 1 if current_quarter > 1 else 4
                 year = today.year if current_quarter > 1 else today.year - 1
-                start_date = datetime(year, 3 * last_quarter - 2, 1)
+                start_month = 3 * last_quarter - 2
+                start_datetime = datetime(year, start_month, 1)
                 if last_quarter == 4:
-                    end_date = datetime(year + 1, 1, 1) - timedelta(days=1)
+                    end_datetime = datetime(year + 1, 1, 1) - timedelta(days=1)
                 else:
-                    end_date = datetime(year, 3 * last_quarter + 1, 1) - timedelta(days=1)
+                    end_datetime = datetime(year, start_month + 2, 1) + relativedelta(months=1, days=-1)
             elif days == "ytd":
-                start_date = datetime(today.year, 1, 1)
-                end_date = today
+                # Year to date
+                start_datetime = datetime(today.year, 1, 1)
+                end_datetime = today
             elif days == "last_year":
-                start_date = datetime(today.year - 1, 1, 1)
-                end_date = datetime(today.year - 1, 12, 31)
+                # Last year
+                start_datetime = datetime(today.year - 1, 1, 1)
+                end_datetime = datetime(today.year - 1, 12, 31)
             else:
-                start_date = today - timedelta(days=days)
-                end_date = today
-        
-        # Convert to datetime
-        start_datetime = datetime.combine(start_date, datetime.min.time())
-        end_datetime = datetime.combine(end_date, datetime.max.time())
+                # Last X days
+                start_datetime = today - timedelta(days=days)
+                end_datetime = today
         
         return start_datetime, end_datetime
     
@@ -480,11 +449,13 @@ class PerformanceDashboard:
                 'total_transactions': 0,
                 'transaction_value': 0,
                 'top_product': 'N/A',
-                'top_product_count': 0
+                'top_product_count': 0,
+                'success_rate': 0,
+                'avg_transaction_value': 0
             })
             return metrics
         
-        # Check for required columns
+        # Check for required columns in transactions
         if 'created_at' not in transactions_df.columns:
             st.warning("⚠️ 'created_at' column not found in transaction data")
             # Try alternative column names
@@ -492,16 +463,16 @@ class PerformanceDashboard:
             if date_columns:
                 transactions_df = transactions_df.rename(columns={date_columns[0]: 'created_at'})
                 transactions_df['created_at'] = pd.to_datetime(transactions_df['created_at'], errors='coerce')
-            else:
-                st.error("No date column found in transaction data")
-                return metrics
         
         # Filter data for the period
         try:
-            period_transactions = transactions_df[
-                (transactions_df['created_at'] >= start_date) & 
-                (transactions_df['created_at'] <= end_date)
-            ]
+            if 'created_at' in transactions_df.columns:
+                period_transactions = transactions_df[
+                    (transactions_df['created_at'] >= start_date) & 
+                    (transactions_df['created_at'] <= end_date)
+                ]
+            else:
+                period_transactions = transactions_df
         except Exception as e:
             st.error(f"Error filtering transactions: {e}")
             period_transactions = pd.DataFrame()
@@ -600,6 +571,23 @@ class PerformanceDashboard:
             metrics['top_product'] = 'N/A'
             metrics['top_product_count'] = 0
         
+        # Success Rate
+        if not period_transactions.empty and 'status' in period_transactions.columns:
+            try:
+                total_transactions = len(period_transactions)
+                successful_count = len(period_transactions[period_transactions['status'] == 'SUCCESS'])
+                metrics['success_rate'] = (successful_count / total_transactions * 100) if total_transactions > 0 else 0
+            except:
+                metrics['success_rate'] = 0
+        else:
+            metrics['success_rate'] = 0
+        
+        # Average Transaction Value
+        if metrics.get('total_transactions', 0) > 0 and metrics.get('transaction_value', 0) > 0:
+            metrics['avg_transaction_value'] = metrics['transaction_value'] / metrics['total_transactions']
+        else:
+            metrics['avg_transaction_value'] = 0
+        
         return metrics
     
     def display_executive_snapshot(self, metrics):
@@ -662,6 +650,22 @@ class PerformanceDashboard:
                 "Top Product",
                 f"{product_text} ({top_count})"
             ), unsafe_allow_html=True)
+        
+        # Success rate and average value
+        st.markdown("---")
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.markdown(self.create_metric_card(
+                "Success Rate",
+                f"{metrics.get('success_rate', 0):.1f}%"
+            ), unsafe_allow_html=True)
+        
+        with col2:
+            st.markdown(self.create_metric_card(
+                "Avg Transaction Value",
+                f"₦{metrics.get('avg_transaction_value', 0):,.0f}"
+            ), unsafe_allow_html=True)
     
     def display_product_performance(self, transactions_df, selected_products):
         """Display product performance analysis"""
@@ -669,36 +673,6 @@ class PerformanceDashboard:
         
         if transactions_df is None or transactions_df.empty:
             st.markdown('<div class="warning-box">⚠️ No transaction data available for the selected period</div>', unsafe_allow_html=True)
-            
-            # Show sample product performance
-            st.info("Here's what product performance analysis would look like with data:")
-            
-            # Sample data for demonstration
-            sample_data = pd.DataFrame({
-                'Product': ['Internal Wallet Transfer', 'Deposit', 'Airtime Topup', 'Nawec Cashpower', 'Ticket'],
-                'Transactions': [1250, 890, 2100, 340, 120],
-                'Unique Users': [850, 620, 1500, 280, 95],
-                'Total Amount': [1250000, 890000, 1050000, 170000, 60000]
-            })
-            
-            col1, col2 = st.columns([3, 2])
-            
-            with col1:
-                fig = px.bar(
-                    sample_data,
-                    x='Product',
-                    y='Transactions',
-                    title='Sample: Product Performance',
-                    color='Transactions',
-                    color_continuous_scale='Blues'
-                )
-                fig.update_layout(height=400)
-                st.plotly_chart(fig, use_container_width=True)
-            
-            with col2:
-                st.markdown("**Sample Product Summary**")
-                st.dataframe(sample_data, use_container_width=True, hide_index=True)
-            
             return
         
         # Filter successful customer transactions
@@ -749,7 +723,7 @@ class PerformanceDashboard:
                     'Transactions': len(product_trans),
                     'Unique Users': product_trans['user_identifier'].nunique() if 'user_identifier' in product_trans.columns else 0,
                     'Total Amount': product_trans['amount'].sum() if 'amount' in product_trans.columns else 0,
-                    'Avg Amount': product_trans['amount'].mean() if 'amount' in product_trans.columns else 0
+                    'Avg Amount': product_trans['amount'].mean() if 'amount' in product_trans.columns and len(product_trans) > 0 else 0
                 })
         
         if product_data:
@@ -760,58 +734,66 @@ class PerformanceDashboard:
             
             with col1:
                 # Transactions by product
-                fig = px.bar(
-                    product_df.sort_values('Transactions', ascending=False).head(10),
-                    x='Product',
-                    y='Transactions',
-                    title='Top 10 Products by Transaction Count',
-                    color='Transactions',
-                    color_continuous_scale='Blues'
-                )
-                fig.update_layout(
-                    xaxis_title="Product",
-                    yaxis_title="Number of Transactions",
-                    height=400,
-                    showlegend=False
-                )
-                st.plotly_chart(fig, use_container_width=True)
+                display_df = product_df.sort_values('Transactions', ascending=False).head(10)
+                if not display_df.empty:
+                    fig = px.bar(
+                        display_df,
+                        x='Product',
+                        y='Transactions',
+                        title='Top 10 Products by Transaction Count',
+                        color='Transactions',
+                        color_continuous_scale='Blues'
+                    )
+                    fig.update_layout(
+                        xaxis_title="Product",
+                        yaxis_title="Number of Transactions",
+                        height=400,
+                        showlegend=False
+                    )
+                    st.plotly_chart(fig, use_container_width=True)
+                else:
+                    st.info("No product data to display")
             
             with col2:
                 # Product summary table
                 st.markdown("**Product Performance Summary**")
-                summary_df = product_df.sort_values('Transactions', ascending=False)
-                summary_df = summary_df[['Product', 'Transactions', 'Unique Users', 'Total Amount']]
-                summary_df['Total Amount'] = summary_df['Total Amount'].apply(lambda x: f"₦{x:,.0f}" if pd.notnull(x) else "₦0")
-                st.dataframe(
-                    summary_df,
-                    use_container_width=True,
-                    hide_index=True
-                )
+                if not product_df.empty:
+                    summary_df = product_df.sort_values('Transactions', ascending=False)
+                    summary_df = summary_df[['Product', 'Transactions', 'Unique Users', 'Total Amount']].copy()
+                    summary_df['Total Amount'] = summary_df['Total Amount'].apply(lambda x: f"₦{x:,.0f}" if pd.notnull(x) else "₦0")
+                    st.dataframe(
+                        summary_df,
+                        use_container_width=True,
+                        hide_index=True
+                    )
+                else:
+                    st.info("No product summary data available")
             
             # Amount by product
-            st.markdown("---")
-            col1, col2 = st.columns([2, 1])
-            
-            with col1:
-                fig2 = px.pie(
-                    product_df[product_df['Total Amount'] > 0],
-                    values='Total Amount',
-                    names='Product',
-                    title='Transaction Value Distribution by Product',
-                    hole=0.3
-                )
-                fig2.update_traces(textposition='inside', textinfo='percent+label')
-                st.plotly_chart(fig2, use_container_width=True)
-            
-            with col2:
-                # Key metrics
-                st.markdown("**Key Metrics**")
-                total_transactions = product_df['Transactions'].sum()
-                total_users = product_df['Unique Users'].sum()
-                avg_trans_per_user = total_transactions / total_users if total_users > 0 else 0
-                st.metric("Avg Transactions per User", f"{avg_trans_per_user:.1f}")
-                st.metric("Total Unique Product Users", f"{total_users:,.0f}")
-                st.metric("Overall Transaction Value", f"₦{product_df['Total Amount'].sum():,.0f}")
+            if not product_df.empty and product_df['Total Amount'].sum() > 0:
+                st.markdown("---")
+                col1, col2 = st.columns([2, 1])
+                
+                with col1:
+                    fig2 = px.pie(
+                        product_df[product_df['Total Amount'] > 0],
+                        values='Total Amount',
+                        names='Product',
+                        title='Transaction Value Distribution by Product',
+                        hole=0.3
+                    )
+                    fig2.update_traces(textposition='inside', textinfo='percent+label')
+                    st.plotly_chart(fig2, use_container_width=True)
+                
+                with col2:
+                    # Key metrics
+                    st.markdown("**Key Metrics**")
+                    total_transactions = product_df['Transactions'].sum()
+                    total_users = product_df['Unique Users'].sum()
+                    avg_trans_per_user = total_transactions / total_users if total_users > 0 else 0
+                    st.metric("Avg Transactions per User", f"{avg_trans_per_user:.1f}")
+                    st.metric("Total Unique Product Users", f"{total_users:,.0f}")
+                    st.metric("Overall Transaction Value", f"₦{product_df['Total Amount'].sum():,.0f}")
         else:
             st.info("No product performance data available for selected filters")
     
@@ -821,35 +803,6 @@ class PerformanceDashboard:
         
         if onboarding_df is None or onboarding_df.empty:
             st.markdown('<div class="warning-box">⚠️ No onboarding data available for the selected period</div>', unsafe_allow_html=True)
-            
-            # Show sample visualization
-            st.info("Here's what customer acquisition analysis would look like with data:")
-            
-            # Sample data
-            sample_dates = pd.date_range(start=datetime.now() - timedelta(days=30), end=datetime.now(), freq='D')
-            sample_registrations = pd.DataFrame({
-                'date': sample_dates,
-                'registrations': np.random.randint(10, 50, len(sample_dates))
-            })
-            
-            col1, col2 = st.columns(2)
-            
-            with col1:
-                fig = px.line(
-                    sample_registrations,
-                    x='date',
-                    y='registrations',
-                    title='Sample: Daily Customer Registrations'
-                )
-                fig.update_layout(height=300)
-                st.plotly_chart(fig, use_container_width=True)
-            
-            with col2:
-                st.markdown("**Sample Metrics**")
-                st.metric("Total Registrations", "1,250")
-                st.metric("Active Status", "890 (71%)")
-                st.metric("KYC Verified", "750 (60%)")
-            
             return
         
         # Check for required columns
@@ -1014,15 +967,20 @@ class PerformanceDashboard:
                 st.metric("Avg Transaction Value", "₦0")
         
         with col3:
-            if not daily_transactions.empty:
-                peak_day = daily_transactions.idxmax()
-                peak_day_count = daily_transactions.max()
-                st.metric("Peak Day", f"{peak_day.strftime('%b %d')}: {peak_day_count:,}")
+            if 'created_at' in successful_transactions.columns and not successful_transactions.empty:
+                successful_transactions['date'] = pd.to_datetime(successful_transactions['created_at']).dt.date
+                daily_counts = successful_transactions.groupby('date').size()
+                if not daily_counts.empty:
+                    peak_date = daily_counts.idxmax()
+                    peak_count = daily_counts.max()
+                    st.metric("Peak Day", f"{peak_date.strftime('%b %d')}: {peak_count:,}")
+                else:
+                    st.metric("Peak Day", "N/A")
             else:
                 st.metric("Peak Day", "N/A")
     
     def display_trend_analysis(self, transactions_df, onboarding_df):
-        """Display trend analysis"""
+        """Display trend analysis with fixed Plotly layout"""
         st.markdown('<div class="sub-header">📈 Trend Analysis</div>', unsafe_allow_html=True)
         
         if (transactions_df is None or transactions_df.empty) and (onboarding_df is None or onboarding_df.empty):
@@ -1042,7 +1000,8 @@ class PerformanceDashboard:
                         weekly_transactions = successful_transactions.groupby('week').agg({
                             'amount': 'sum' if 'amount' in successful_transactions.columns else None,
                             'id': 'count' if 'id' in successful_transactions.columns else None
-                        }).rename(columns={'id': 'transaction_count', 'amount': 'transaction_value'})
+                        })
+                        weekly_transactions.columns = ['transaction_value', 'transaction_count']
             except Exception as e:
                 st.error(f"Error preparing transaction trends: {e}")
         
@@ -1060,109 +1019,87 @@ class PerformanceDashboard:
             except Exception as e:
                 st.error(f"Error preparing registration trends: {e}")
         
-        # Merge data if we have both
-        if not weekly_transactions.empty and not weekly_registrations.empty:
-            trend_df = weekly_transactions.reset_index().merge(
-                weekly_registrations,
-                on='week',
-                how='outer'
-            ).fillna(0)
-        elif not weekly_transactions.empty:
-            trend_df = weekly_transactions.reset_index()
-            trend_df['registrations'] = 0
-        elif not weekly_registrations.empty:
-            trend_df = weekly_registrations
-            trend_df['transaction_count'] = 0
-            trend_df['transaction_value'] = 0
-        else:
-            st.info("Not enough data for trend analysis")
-            return
-        
-        if len(trend_df) > 1:
+        # Create a simple trend chart without complex y-axis configuration
+        try:
             fig = go.Figure()
             
-            # Add transaction count trace if available
-            if 'transaction_count' in trend_df.columns and trend_df['transaction_count'].sum() > 0:
+            # Add traces based on available data
+            traces_added = False
+            
+            if not weekly_transactions.empty and 'transaction_count' in weekly_transactions.columns:
                 fig.add_trace(go.Scatter(
-                    x=trend_df['week'],
-                    y=trend_df['transaction_count'],
+                    x=weekly_transactions.index,
+                    y=weekly_transactions['transaction_count'],
                     name='Transaction Count',
-                    yaxis='y1',
                     line=dict(color='#1E3A8A', width=3)
                 ))
+                traces_added = True
             
-            # Add transaction value trace if available
-            if 'transaction_value' in trend_df.columns and trend_df['transaction_value'].sum() > 0:
+            if not weekly_registrations.empty:
                 fig.add_trace(go.Scatter(
-                    x=trend_df['week'],
-                    y=trend_df['transaction_value'],
-                    name='Transaction Value (₦)',
-                    yaxis='y2',
+                    x=weekly_registrations['week'],
+                    y=weekly_registrations['registrations'],
+                    name='New Registrations',
                     line=dict(color='#10B981', width=3, dash='dash')
                 ))
+                traces_added = True
             
-            # Add registrations trace if available
-            if 'registrations' in trend_df.columns and trend_df['registrations'].sum() > 0:
-                fig.add_trace(go.Bar(
-                    x=trend_df['week'],
-                    y=trend_df['registrations'],
-                    name='New Registrations',
-                    yaxis='y3',
-                    marker_color='#F59E0B',
-                    opacity=0.6
+            if not weekly_transactions.empty and 'transaction_value' in weekly_transactions.columns:
+                # Create secondary axis for transaction value
+                fig.add_trace(go.Scatter(
+                    x=weekly_transactions.index,
+                    y=weekly_transactions['transaction_value'],
+                    name='Transaction Value (₦)',
+                    line=dict(color='#F59E0B', width=3),
+                    yaxis="y2"
                 ))
+                traces_added = True
             
-            fig.update_layout(
-                title='Weekly Performance Trends',
-                xaxis=dict(title='Week'),
-                height=500,
-                showlegend=True,
-                legend=dict(
-                    yanchor="top",
-                    y=0.99,
-                    xanchor="left",
-                    x=0.01
-                )
-            )
-            
-            # Add yaxes based on available data
-            yaxis_config = []
-            if 'transaction_count' in trend_df.columns and trend_df['transaction_count'].sum() > 0:
-                yaxis_config.append(dict(
-                    title='Transaction Count',
-                    titlefont=dict(color='#1E3A8A'),
-                    tickfont=dict(color='#1E3A8A')
-                ))
-            
-            if 'transaction_value' in trend_df.columns and trend_df['transaction_value'].sum() > 0:
-                yaxis_config.append(dict(
-                    title='Transaction Value (₦)',
-                    titlefont=dict(color='#10B981'),
-                    tickfont=dict(color='#10B981'),
-                    anchor='x',
-                    overlaying='y',
-                    side='right'
-                ))
-            
-            if 'registrations' in trend_df.columns and trend_df['registrations'].sum() > 0:
-                yaxis_config.append(dict(
-                    title='New Registrations',
-                    titlefont=dict(color='#F59E0B'),
-                    tickfont=dict(color='#F59E0B'),
-                    anchor='free',
-                    overlaying='y',
-                    side='right',
-                    position=0.95
-                ))
-            
-            fig.update_layout(yaxis=yaxis_config[0] if yaxis_config else {})
-            if len(yaxis_config) > 1:
-                for i, config in enumerate(yaxis_config[1:], 2):
-                    fig.update_layout(**{f'yaxis{i}': config})
-            
-            st.plotly_chart(fig, use_container_width=True)
-        else:
-            st.info("Not enough data points for trend analysis")
+            if traces_added:
+                # Configure layout
+                layout_config = {
+                    'title': 'Weekly Performance Trends',
+                    'xaxis': dict(title='Week'),
+                    'yaxis': dict(
+                        title='Count',
+                        titlefont=dict(color='#1E3A8A'),
+                        tickfont=dict(color='#1E3A8A')
+                    ),
+                    'height': 500,
+                    'showlegend': True,
+                    'legend': dict(
+                        yanchor="top",
+                        y=0.99,
+                        xanchor="left",
+                        x=0.01
+                    )
+                }
+                
+                # Add secondary axis if we have transaction value
+                if not weekly_transactions.empty and 'transaction_value' in weekly_transactions.columns:
+                    layout_config['yaxis2'] = dict(
+                        title='Transaction Value (₦)',
+                        titlefont=dict(color='#F59E0B'),
+                        tickfont=dict(color='#F59E0B'),
+                        anchor='x',
+                        overlaying='y',
+                        side='right'
+                    )
+                
+                fig.update_layout(**layout_config)
+                st.plotly_chart(fig, use_container_width=True)
+            else:
+                st.info("Not enough data for trend analysis")
+                
+        except Exception as e:
+            st.error(f"Error creating trend chart: {e}")
+            # Fallback to simple display
+            if not weekly_transactions.empty:
+                st.write("Transaction Trends:")
+                st.dataframe(weekly_transactions.head())
+            if not weekly_registrations.empty:
+                st.write("Registration Trends:")
+                st.dataframe(weekly_registrations.head())
     
     def run_dashboard(self):
         """Main method to run the dashboard"""
@@ -1318,70 +1255,53 @@ class PerformanceDashboard:
         
         else:
             # Welcome/instructions
-            st.markdown('<div class="success-box">👋 Welcome to the Business Development Performance Dashboard!</div>', unsafe_allow_html=True)
+            st.markdown('<div class="info-box">👋 Welcome to the Business Development Performance Dashboard!</div>', unsafe_allow_html=True)
             
-            st.info("""
-            ### Getting Started:
-            1. **Test your database connection** using the button in the sidebar
-            2. **Select a date range** using the flexible date picker
-            3. **Choose product categories** you want to analyze
-            4. **Click 'Load Data'** to fetch data from your MySQL database
-            5. **Explore the analytics** in the main dashboard
-            
-            ### Features:
-            - 📈 **Executive Snapshot**: Key performance metrics at a glance
-            - 📊 **Product Performance**: Detailed analysis of product usage
-            - 👥 **Customer Acquisition**: Registration and KYC analytics
-            - 💳 **Transaction Analysis**: Volume, value, and success rates
-            - 📈 **Trend Analysis**: Weekly performance trends
-            - 📥 **Export Options**: Download data for further analysis
-            """)
-            
-            # Quick start tips
             col1, col2 = st.columns(2)
             
             with col1:
-                st.markdown("### 💡 Quick Tips")
+                st.markdown("### 🚀 Quick Start")
                 st.markdown("""
-                - Try different date ranges for comparison
-                - Use the custom date range for specific periods
-                - Filter by product categories to focus on specific areas
-                - Export data for external reporting
-                - Check data preview for quality assurance
+                1. **Test database connection** in sidebar
+                2. **Select date range** (try Last 90 Days)
+                3. **Choose product categories** to analyze
+                4. **Click 'Load Data'** to fetch from MySQL
+                5. **Explore analytics** in main dashboard
                 """)
             
             with col2:
-                st.markdown("### 🔧 Troubleshooting")
+                st.markdown("### 🔧 Features")
                 st.markdown("""
-                - **No data?** Try a wider date range
-                - **Connection issues?** Check database credentials
-                - **Missing columns?** The app will show available columns
-                - **Slow loading?** Reduce date range or filter products
-                - **Errors?** Check the console for detailed error messages
+                - 📈 **Executive Snapshot**: Key metrics
+                - 📊 **Product Performance**: Detailed analysis
+                - 👥 **Customer Acquisition**: Registration analytics
+                - 💳 **Transaction Analysis**: Volume & value
+                - 📈 **Trend Analysis**: Weekly performance
+                - 📥 **Export Options**: Download CSV data
                 """)
             
-            # Sample visualization placeholder
-            st.markdown('<div class="section-divider"></div>', unsafe_allow_html=True)
-            st.markdown("### 📋 Dashboard Preview")
+            # Date range examples
+            st.markdown("### 📅 Available Date Ranges")
+            col1, col2, col3 = st.columns(3)
             
-            # Create sample data for preview
-            sample_dates = pd.date_range(start=datetime.now() - timedelta(days=30), end=datetime.now(), freq='D')
-            sample_data = pd.DataFrame({
-                'date': sample_dates,
-                'transactions': np.random.randint(100, 500, len(sample_dates)),
-                'registrations': np.random.randint(10, 50, len(sample_dates))
-            })
+            with col1:
+                st.markdown("**Short-term:**")
+                st.markdown("- Last 7 Days")
+                st.markdown("- Last 30 Days")
+                st.markdown("- Last 90 Days")
             
-            fig = px.line(
-                sample_data,
-                x='date',
-                y=['transactions', 'registrations'],
-                title='Sample Dashboard: Daily Performance Metrics',
-                labels={'value': 'Count', 'date': 'Date'},
-                color_discrete_sequence=['#1E3A8A', '#10B981']
-            )
-            fig.update_layout(height=400)
-            st.plotly_chart(fig, use_container_width=True)
+            with col2:
+                st.markdown("**Monthly:**")
+                st.markdown("- This Month")
+                st.markdown("- Last Month")
+            
+            with col3:
+                st.markdown("**Quarterly/Yearly:**")
+                st.markdown("- This Quarter")
+                st.markdown("- Last Quarter")
+                st.markdown("- Year to Date")
+                st.markdown("- Last Year")
+                st.markdown("- Custom Range")
 
 # Main execution
 def main():
