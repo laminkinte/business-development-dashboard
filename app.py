@@ -7,7 +7,6 @@ import plotly.express as px
 import pymysql
 from pymysql import MySQLError
 import warnings
-from dateutil.relativedelta import relativedelta
 
 warnings.filterwarnings('ignore')
 
@@ -68,18 +67,6 @@ st.markdown("""
     .section-divider {
         border-top: 2px solid #E5E7EB;
         margin: 2rem 0;
-    }
-    .product-card {
-        background-color: white;
-        border-radius: 8px;
-        padding: 1rem;
-        box-shadow: 0 2px 4px rgba(0, 0, 0, 0.05);
-        border: 1px solid #E5E7EB;
-        transition: transform 0.2s;
-    }
-    .product-card:hover {
-        transform: translateY(-2px);
-        box-shadow: 0 4px 8px rgba(0, 0, 0, 0.1);
     }
     .warning-box {
         background-color: #FEF3C7;
@@ -145,6 +132,8 @@ class PerformanceDashboard:
             st.session_state.start_date = None
         if 'end_date' not in st.session_state:
             st.session_state.end_date = None
+        if 'filtered_transactions' not in st.session_state:
+            st.session_state.filtered_transactions = pd.DataFrame()
     
     def get_db_connection(self):
         """Establish MySQL database connection"""
@@ -231,10 +220,12 @@ class PerformanceDashboard:
                             transactions_df[col] = transactions_df[col].astype(str).str.strip()
                     
                     st.session_state.transactions = transactions_df
+                    st.session_state.filtered_transactions = transactions_df  # Store for filtering
                     st.success(f"✅ Loaded {len(transactions_df)} transaction records")
                 else:
                     st.warning("⚠️ No transaction records found in the selected date range")
                     st.session_state.transactions = pd.DataFrame()
+                    st.session_state.filtered_transactions = pd.DataFrame()
                 
                 # Load onboarding data
                 st.info("Loading onboarding data...")
@@ -306,7 +297,7 @@ class PerformanceDashboard:
         selected_option = st.sidebar.selectbox(
             "Select Date Range",
             list(date_options.keys()),
-            index=2  # Default to Last 90 Days
+            index=1  # Default to Last 30 Days
         )
         
         today = datetime.now()
@@ -316,7 +307,7 @@ class PerformanceDashboard:
             with col1:
                 start_date = st.date_input(
                     "Start Date",
-                    value=today - timedelta(days=90),
+                    value=today - timedelta(days=30),
                     max_value=today
                 )
             with col2:
@@ -342,7 +333,8 @@ class PerformanceDashboard:
                     start_datetime = datetime(today.year - 1, 12, 1)
                 else:
                     start_datetime = datetime(today.year, today.month - 1, 1)
-                end_datetime = start_datetime + relativedelta(months=1, days=-1)
+                end_datetime = start_datetime.replace(day=28) + timedelta(days=4)
+                end_datetime = end_datetime - timedelta(days=end_datetime.day)
             elif days == "quarter":
                 # This quarter
                 current_quarter = (today.month - 1) // 3 + 1
@@ -356,10 +348,9 @@ class PerformanceDashboard:
                 year = today.year if current_quarter > 1 else today.year - 1
                 start_month = 3 * last_quarter - 2
                 start_datetime = datetime(year, start_month, 1)
-                if last_quarter == 4:
-                    end_datetime = datetime(year + 1, 1, 1) - timedelta(days=1)
-                else:
-                    end_datetime = datetime(year, start_month + 2, 1) + relativedelta(months=1, days=-1)
+                end_month = start_month + 2
+                end_datetime = datetime(year, end_month, 28) + timedelta(days=4)
+                end_datetime = end_datetime - timedelta(days=end_datetime.day)
             elif days == "ytd":
                 # Year to date
                 start_datetime = datetime(today.year, 1, 1)
@@ -393,6 +384,31 @@ class PerformanceDashboard:
                 selected_products.append('Airtime Topup')
             else:
                 selected_products.extend(self.product_categories.get(category, []))
+        
+        # Apply product filter to transactions
+        if st.session_state.data_loaded and not st.session_state.transactions.empty:
+            transactions_df = st.session_state.transactions.copy()
+            
+            # Filter by selected products
+            if selected_products:
+                # Create filter for both product_name and service_name
+                product_filter = pd.Series([False] * len(transactions_df))
+                
+                for product in selected_products:
+                    if product == 'Airtime Topup':
+                        if 'service_name' in transactions_df.columns:
+                            product_filter |= (transactions_df['service_name'] == product)
+                    else:
+                        if 'product_name' in transactions_df.columns:
+                            product_filter |= (transactions_df['product_name'] == product)
+                
+                if product_filter.any():
+                    st.session_state.filtered_transactions = transactions_df[product_filter].copy()
+                    st.sidebar.success(f"✅ Filtered to {len(st.session_state.filtered_transactions):,} transactions")
+                else:
+                    st.session_state.filtered_transactions = transactions_df
+            else:
+                st.session_state.filtered_transactions = transactions_df
         
         return selected_products if selected_products else self.all_products
     
@@ -455,27 +471,8 @@ class PerformanceDashboard:
             })
             return metrics
         
-        # Check for required columns in transactions
-        if 'created_at' not in transactions_df.columns:
-            st.warning("⚠️ 'created_at' column not found in transaction data")
-            # Try alternative column names
-            date_columns = [col for col in transactions_df.columns if 'date' in col.lower() or 'created' in col.lower()]
-            if date_columns:
-                transactions_df = transactions_df.rename(columns={date_columns[0]: 'created_at'})
-                transactions_df['created_at'] = pd.to_datetime(transactions_df['created_at'], errors='coerce')
-        
-        # Filter data for the period
-        try:
-            if 'created_at' in transactions_df.columns:
-                period_transactions = transactions_df[
-                    (transactions_df['created_at'] >= start_date) & 
-                    (transactions_df['created_at'] <= end_date)
-                ]
-            else:
-                period_transactions = transactions_df
-        except Exception as e:
-            st.error(f"Error filtering transactions: {e}")
-            period_transactions = pd.DataFrame()
+        # Filter data for the period - use already filtered transactions
+        period_transactions = transactions_df.copy()
         
         # Filter onboarding for the period
         if onboarding_df is not None and not onboarding_df.empty and 'registration_date' in onboarding_df.columns:
@@ -500,7 +497,6 @@ class PerformanceDashboard:
                 metrics['new_customers_temporary'] = status_counts.get('TemporaryRegister', 0)
                 metrics['new_customers_total'] = customer_onboarding['account_id'].nunique()
             except Exception as e:
-                st.error(f"Error calculating new customers: {e}")
                 metrics['new_customers_active'] = 0
                 metrics['new_customers_registered'] = 0
                 metrics['new_customers_temporary'] = 0
@@ -526,7 +522,6 @@ class PerformanceDashboard:
                 else:
                     metrics['active_customers'] = 0
             except Exception as e:
-                st.error(f"Error calculating active customers: {e}")
                 metrics['active_customers'] = 0
         else:
             metrics['active_customers'] = 0
@@ -542,7 +537,6 @@ class PerformanceDashboard:
                 else:
                     metrics['transaction_value'] = 0
             except Exception as e:
-                st.error(f"Error calculating transaction metrics: {e}")
                 metrics['total_transactions'] = 0
                 metrics['transaction_value'] = 0
         else:
@@ -550,21 +544,40 @@ class PerformanceDashboard:
             metrics['transaction_value'] = 0
         
         # Top Product
-        if not period_transactions.empty and 'status' in period_transactions.columns and 'entity_name' in period_transactions.columns and 'product_name' in period_transactions.columns:
+        if not period_transactions.empty and 'status' in period_transactions.columns and 'entity_name' in period_transactions.columns:
             try:
-                product_counts = period_transactions[
-                    (period_transactions['status'] == 'SUCCESS') &
-                    (period_transactions['entity_name'] == 'Customer')
-                ]['product_name'].value_counts()
+                # Get all product names (including services)
+                product_counts_dict = {}
                 
-                if not product_counts.empty:
-                    metrics['top_product'] = str(product_counts.index[0])
-                    metrics['top_product_count'] = int(product_counts.iloc[0])
+                # Count regular products
+                if 'product_name' in period_transactions.columns:
+                    product_counts = period_transactions[
+                        (period_transactions['status'] == 'SUCCESS') &
+                        (period_transactions['entity_name'] == 'Customer')
+                    ]['product_name'].value_counts()
+                    
+                    for product, count in product_counts.items():
+                        product_counts_dict[product] = count
+                
+                # Count services
+                if 'service_name' in period_transactions.columns:
+                    service_counts = period_transactions[
+                        (period_transactions['status'] == 'SUCCESS') &
+                        (period_transactions['entity_name'] == 'Customer') &
+                        (period_transactions['service_name'].notna())
+                    ]['service_name'].value_counts()
+                    
+                    for service, count in service_counts.items():
+                        product_counts_dict[service] = count
+                
+                if product_counts_dict:
+                    top_product = max(product_counts_dict, key=product_counts_dict.get)
+                    metrics['top_product'] = str(top_product)
+                    metrics['top_product_count'] = product_counts_dict[top_product]
                 else:
                     metrics['top_product'] = 'N/A'
                     metrics['top_product_count'] = 0
             except Exception as e:
-                st.error(f"Error calculating top product: {e}")
                 metrics['top_product'] = 'N/A'
                 metrics['top_product_count'] = 0
         else:
@@ -1019,13 +1032,13 @@ class PerformanceDashboard:
             except Exception as e:
                 st.error(f"Error preparing registration trends: {e}")
         
-        # Create a simple trend chart without complex y-axis configuration
+        # Create trend visualization
         try:
             fig = go.Figure()
             
-            # Add traces based on available data
             traces_added = False
             
+            # Add transaction count trace
             if not weekly_transactions.empty and 'transaction_count' in weekly_transactions.columns:
                 fig.add_trace(go.Scatter(
                     x=weekly_transactions.index,
@@ -1035,6 +1048,7 @@ class PerformanceDashboard:
                 ))
                 traces_added = True
             
+            # Add registration trace
             if not weekly_registrations.empty:
                 fig.add_trace(go.Scatter(
                     x=weekly_registrations['week'],
@@ -1044,62 +1058,55 @@ class PerformanceDashboard:
                 ))
                 traces_added = True
             
-            if not weekly_transactions.empty and 'transaction_value' in weekly_transactions.columns:
-                # Create secondary axis for transaction value
-                fig.add_trace(go.Scatter(
-                    x=weekly_transactions.index,
-                    y=weekly_transactions['transaction_value'],
-                    name='Transaction Value (₦)',
-                    line=dict(color='#F59E0B', width=3),
-                    yaxis="y2"
-                ))
-                traces_added = True
-            
             if traces_added:
-                # Configure layout
-                layout_config = {
-                    'title': 'Weekly Performance Trends',
-                    'xaxis': dict(title='Week'),
-                    'yaxis': dict(
-                        title='Count',
-                        titlefont=dict(color='#1E3A8A'),
-                        tickfont=dict(color='#1E3A8A')
-                    ),
-                    'height': 500,
-                    'showlegend': True,
-                    'legend': dict(
+                # Configure layout - FIXED: Use proper property names
+                fig.update_layout(
+                    title='Weekly Performance Trends',
+                    xaxis_title='Week',
+                    yaxis_title='Count',
+                    height=500,
+                    showlegend=True,
+                    legend=dict(
                         yanchor="top",
                         y=0.99,
                         xanchor="left",
                         x=0.01
                     )
-                }
+                )
                 
-                # Add secondary axis if we have transaction value
+                # Add secondary axis for transaction value if available
                 if not weekly_transactions.empty and 'transaction_value' in weekly_transactions.columns:
-                    layout_config['yaxis2'] = dict(
-                        title='Transaction Value (₦)',
-                        titlefont=dict(color='#F59E0B'),
-                        tickfont=dict(color='#F59E0B'),
-                        anchor='x',
-                        overlaying='y',
-                        side='right'
+                    fig.add_trace(go.Scatter(
+                        x=weekly_transactions.index,
+                        y=weekly_transactions['transaction_value'],
+                        name='Transaction Value (₦)',
+                        line=dict(color='#F59E0B', width=3),
+                        yaxis="y2"
+                    ))
+                    
+                    fig.update_layout(
+                        yaxis2=dict(
+                            title='Transaction Value (₦)',
+                            overlaying='y',
+                            side='right'
+                        )
                     )
                 
-                fig.update_layout(**layout_config)
                 st.plotly_chart(fig, use_container_width=True)
             else:
                 st.info("Not enough data for trend analysis")
                 
         except Exception as e:
             st.error(f"Error creating trend chart: {e}")
-            # Fallback to simple display
+            
+            # Fallback to simple data display
             if not weekly_transactions.empty:
-                st.write("Transaction Trends:")
-                st.dataframe(weekly_transactions.head())
+                st.write("**Transaction Trends:**")
+                st.dataframe(weekly_transactions.head(10))
+            
             if not weekly_registrations.empty:
-                st.write("Registration Trends:")
-                st.dataframe(weekly_registrations.head())
+                st.write("**Registration Trends:**")
+                st.dataframe(weekly_registrations.head(10))
     
     def run_dashboard(self):
         """Main method to run the dashboard"""
@@ -1122,7 +1129,7 @@ class PerformanceDashboard:
             # Date range selection
             start_date, end_date = self.create_date_filters()
             
-            # Product filters
+            # Product filters - this now filters the data
             selected_products = self.create_product_filters()
             
             # Load data button
@@ -1138,7 +1145,10 @@ class PerformanceDashboard:
             st.markdown("### 📊 Data Status")
             
             if st.session_state.data_loaded:
-                if st.session_state.transactions is not None and not st.session_state.transactions.empty:
+                # Show counts for filtered transactions
+                if st.session_state.filtered_transactions is not None and not st.session_state.filtered_transactions.empty:
+                    st.success(f"✅ Transactions: {len(st.session_state.filtered_transactions):,} records")
+                elif st.session_state.transactions is not None and not st.session_state.transactions.empty:
                     st.success(f"✅ Transactions: {len(st.session_state.transactions):,} records")
                 else:
                     st.warning("⚠️ No transaction records loaded")
@@ -1161,17 +1171,20 @@ class PerformanceDashboard:
         # Main content area
         if st.session_state.data_loaded:
             # Check if we have any data
-            has_transactions = st.session_state.transactions is not None and not st.session_state.transactions.empty
+            has_transactions = st.session_state.filtered_transactions is not None and not st.session_state.filtered_transactions.empty
             has_onboarding = st.session_state.onboarding is not None and not st.session_state.onboarding.empty
             
             if not has_transactions and not has_onboarding:
                 st.markdown('<div class="warning-box">⚠️ No data available for the selected date range. Try selecting a different date range.</div>', unsafe_allow_html=True)
                 return
             
+            # Use filtered transactions for analysis
+            analysis_transactions = st.session_state.filtered_transactions
+            
             # Executive Snapshot
             metrics = self.calculate_executive_snapshot(
-                start_date, end_date,
-                st.session_state.transactions,
+                st.session_state.start_date, st.session_state.end_date,
+                analysis_transactions,
                 st.session_state.onboarding
             )
             self.display_executive_snapshot(metrics)
@@ -1179,7 +1192,7 @@ class PerformanceDashboard:
             st.markdown('<div class="section-divider"></div>', unsafe_allow_html=True)
             
             # Product Performance
-            self.display_product_performance(st.session_state.transactions, selected_products)
+            self.display_product_performance(analysis_transactions, selected_products)
             
             st.markdown('<div class="section-divider"></div>', unsafe_allow_html=True)
             
@@ -1190,12 +1203,12 @@ class PerformanceDashboard:
             
             # Transaction Analysis (only if we have transaction data)
             if has_transactions:
-                self.display_transaction_analysis(st.session_state.transactions)
+                self.display_transaction_analysis(analysis_transactions)
                 st.markdown('<div class="section-divider"></div>', unsafe_allow_html=True)
             
             # Trend Analysis (if we have both datasets)
             if has_transactions or has_onboarding:
-                self.display_trend_analysis(st.session_state.transactions, st.session_state.onboarding)
+                self.display_trend_analysis(analysis_transactions, st.session_state.onboarding)
             
             # Export options
             st.markdown('<div class="section-divider"></div>', unsafe_allow_html=True)
@@ -1205,11 +1218,11 @@ class PerformanceDashboard:
             
             with col1:
                 if has_transactions:
-                    csv_transactions = st.session_state.transactions.to_csv(index=False)
+                    csv_transactions = analysis_transactions.to_csv(index=False)
                     st.download_button(
                         label="Download Transaction Data (CSV)",
                         data=csv_transactions,
-                        file_name=f"transactions_{start_date.strftime('%Y%m%d')}_{end_date.strftime('%Y%m%d')}.csv",
+                        file_name=f"transactions_{st.session_state.start_date.strftime('%Y%m%d')}_{st.session_state.end_date.strftime('%Y%m%d')}.csv",
                         mime="text/csv",
                         use_container_width=True
                     )
@@ -1222,7 +1235,7 @@ class PerformanceDashboard:
                     st.download_button(
                         label="Download Onboarding Data (CSV)",
                         data=csv_onboarding,
-                        file_name=f"onboarding_{start_date.strftime('%Y%m%d')}_{end_date.strftime('%Y%m%d')}.csv",
+                        file_name=f"onboarding_{st.session_state.start_date.strftime('%Y%m%d')}_{st.session_state.end_date.strftime('%Y%m%d')}.csv",
                         mime="text/csv",
                         use_container_width=True
                     )
@@ -1236,7 +1249,7 @@ class PerformanceDashboard:
                 with tab1:
                     if has_transactions:
                         st.dataframe(
-                            st.session_state.transactions.head(100),
+                            analysis_transactions.head(100),
                             use_container_width=True,
                             hide_index=True
                         )
@@ -1263,45 +1276,21 @@ class PerformanceDashboard:
                 st.markdown("### 🚀 Quick Start")
                 st.markdown("""
                 1. **Test database connection** in sidebar
-                2. **Select date range** (try Last 90 Days)
+                2. **Select date range** (try Last 30 Days)
                 3. **Choose product categories** to analyze
                 4. **Click 'Load Data'** to fetch from MySQL
                 5. **Explore analytics** in main dashboard
                 """)
             
             with col2:
-                st.markdown("### 🔧 Features")
+                st.markdown("### 🔧 Troubleshooting")
                 st.markdown("""
-                - 📈 **Executive Snapshot**: Key metrics
-                - 📊 **Product Performance**: Detailed analysis
-                - 👥 **Customer Acquisition**: Registration analytics
-                - 💳 **Transaction Analysis**: Volume & value
-                - 📈 **Trend Analysis**: Weekly performance
-                - 📥 **Export Options**: Download CSV data
+                - **No data?** Try wider date range
+                - **Wrong dates?** Dates show when data was loaded
+                - **Metrics mismatch?** Product filters affect data
+                - **Connection issues?** Test database connection
+                - **Slow loading?** Reduce date range
                 """)
-            
-            # Date range examples
-            st.markdown("### 📅 Available Date Ranges")
-            col1, col2, col3 = st.columns(3)
-            
-            with col1:
-                st.markdown("**Short-term:**")
-                st.markdown("- Last 7 Days")
-                st.markdown("- Last 30 Days")
-                st.markdown("- Last 90 Days")
-            
-            with col2:
-                st.markdown("**Monthly:**")
-                st.markdown("- This Month")
-                st.markdown("- Last Month")
-            
-            with col3:
-                st.markdown("**Quarterly/Yearly:**")
-                st.markdown("- This Quarter")
-                st.markdown("- Last Quarter")
-                st.markdown("- Year to Date")
-                st.markdown("- Last Year")
-                st.markdown("- Custom Range")
 
 # Main execution
 def main():
