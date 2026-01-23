@@ -1,19 +1,17 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 import plotly.graph_objects as go
 import plotly.express as px
 import pymysql
-from pymysql import cursors
+from pymysql import MySQLError
 import warnings
 from dateutil.relativedelta import relativedelta
-import os
-from io import BytesIO
 
 warnings.filterwarnings('ignore')
 
-# Set page configuration
+# Page configuration
 st.set_page_config(
     page_title="Business Development Performance Dashboard",
     page_icon="📊",
@@ -26,14 +24,14 @@ st.markdown("""
 <style>
     .main-header {
         font-size: 2.5rem;
-        font-weight: 700;
         color: #1E3A8A;
+        font-weight: 700;
         margin-bottom: 1rem;
     }
     .sub-header {
         font-size: 1.5rem;
-        font-weight: 600;
         color: #374151;
+        font-weight: 600;
         margin-bottom: 1rem;
     }
     .metric-card {
@@ -42,45 +40,61 @@ st.markdown("""
         padding: 1.5rem;
         box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
         border-left: 4px solid #1E3A8A;
+        margin-bottom: 1rem;
     }
-    .positive {
+    .metric-value {
+        font-size: 2rem;
+        font-weight: 700;
+        color: #1E3A8A;
+    }
+    .metric-label {
+        font-size: 0.9rem;
+        color: #6B7280;
+        text-transform: uppercase;
+        letter-spacing: 0.05em;
+    }
+    .trend-up {
         color: #10B981;
         font-weight: 600;
     }
-    .negative {
+    .trend-down {
         color: #EF4444;
         font-weight: 600;
     }
-    .neutral {
+    .trend-neutral {
         color: #6B7280;
         font-weight: 600;
     }
-    .stDataFrame {
-        border-radius: 10px;
-        box-shadow: 0 2px 4px rgba(0, 0, 0, 0.05);
+    .section-divider {
+        border-top: 2px solid #E5E7EB;
+        margin: 2rem 0;
     }
-    .stDateInput > div > div > input {
+    .product-card {
+        background-color: white;
         border-radius: 8px;
+        padding: 1rem;
+        box-shadow: 0 2px 4px rgba(0, 0, 0, 0.05);
+        border: 1px solid #E5E7EB;
+        transition: transform 0.2s;
     }
-    div[data-testid="stMetricValue"] {
-        font-size: 1.8rem;
-        font-weight: 700;
-    }
-    .stTabs [data-baseweb="tab-list"] {
-        gap: 2rem;
-    }
-    .stTabs [data-baseweb="tab"] {
-        height: 50px;
-        white-space: pre-wrap;
-        border-radius: 4px 4px 0px 0px;
-        padding: 10px 20px;
+    .product-card:hover {
+        transform: translateY(-2px);
+        box-shadow: 0 4px 8px rgba(0, 0, 0, 0.1);
     }
 </style>
 """, unsafe_allow_html=True)
 
 class PerformanceDashboard:
     def __init__(self):
-        self.today = datetime.now()
+        # Initialize database connection
+        self.db_config = {
+            'host': 'db4free.net',
+            'database': 'bdp_report',
+            'user': 'lamin_d_kinteh',
+            'password': 'Lamin@123'
+        }
+        
+        # Define product categories
         self.product_categories = {
             'P2P (Internal Wallet Transfer)': ['Internal Wallet Transfer'],
             'Cash-In': ['Deposit'],
@@ -90,1262 +104,895 @@ class PerformanceDashboard:
             'E-Ticketing': ['Ticket'],
             'Bank Transfers': ['BANK_TO_WALLET_TRANSFER', 'WALLET_TO_BANK_TRANSFER']
         }
+        
         self.services = ['Airtime Topup']
+        
+        # Flatten product list
         self.all_products = []
         for category, products in self.product_categories.items():
             self.all_products.extend(products)
         self.all_products.append('Airtime Topup')
         
-    def connect_db(self):
-        """Connect to MySQL database"""
+        # Initialize session state
+        if 'data_loaded' not in st.session_state:
+            st.session_state.data_loaded = False
+        if 'transactions' not in st.session_state:
+            st.session_state.transactions = None
+        if 'onboarding' not in st.session_state:
+            st.session_state.onboarding = None
+        if 'product_performance_history' not in st.session_state:
+            st.session_state.product_performance_history = {}
+    
+    def get_db_connection(self):
+        """Establish MySQL database connection"""
         try:
             connection = pymysql.connect(
-                host='db4free.net',
-                user='lamin_d_kinteh',
-                password='Lamin@123',
-                database='bdp_report',
+                host=self.db_config['host'],
+                user=self.db_config['user'],
+                password=self.db_config['password'],
+                database=self.db_config['database'],
                 charset='utf8mb4',
-                cursorclass=pymysql.cursors.DictCursor,
-                connect_timeout=10
+                cursorclass=pymysql.cursors.DictCursor
             )
             return connection
-        except Exception as e:
-            st.error(f"Database connection failed: {str(e)}")
-            st.info("Please check your database credentials and ensure the database is accessible.")
+        except MySQLError as e:
+            st.error(f"Database connection failed: {e}")
             return None
     
-    def test_connection(self):
-        """Test database connection and table access"""
+    def load_data_from_db(self, start_date, end_date):
+        """Load data from MySQL database"""
+        connection = self.get_db_connection()
+        if not connection:
+            return False
+        
         try:
-            conn = self.connect_db()
-            if conn:
-                with conn.cursor() as cursor:
-                    # Test Transaction table
-                    cursor.execute("SHOW TABLES LIKE 'Transaction'")
-                    transaction_table = cursor.fetchone()
+            with connection.cursor() as cursor:
+                # Load transactions
+                st.info("Loading transaction data...")
+                transaction_query = """
+                    SELECT 
+                        id, user_identifier, transaction_id, sub_transaction_id,
+                        entity_name, full_name, created_by, status, internal_status,
+                        service_name, product_name, transaction_type, amount,
+                        before_balance, after_balance, ucp_name, wallet_name,
+                        pouch_name, reference, error_code, error_message,
+                        vendor_transaction_id, vendor_response_code, vendor_message,
+                        slug, remarks, created_at, business_hierarchy,
+                        parent_user_identifier, parent_full_name
+                    FROM Transaction
+                    WHERE created_at BETWEEN %s AND %s
+                    ORDER BY created_at
+                """
+                cursor.execute(transaction_query, (start_date, end_date))
+                transactions = cursor.fetchall()
+                
+                # Convert to DataFrame
+                if transactions:
+                    transactions_df = pd.DataFrame(transactions)
+                    # Parse dates
+                    transactions_df['created_at'] = pd.to_datetime(transactions_df['created_at'])
+                    # Clean numeric columns
+                    transactions_df['amount'] = pd.to_numeric(transactions_df['amount'], errors='coerce')
+                    # Clean text columns
+                    text_cols = ['user_identifier', 'product_name', 'entity_name', 'transaction_type', 
+                               'ucp_name', 'service_name', 'status']
+                    for col in text_cols:
+                        if col in transactions_df.columns:
+                            transactions_df[col] = transactions_df[col].astype(str).str.strip()
                     
-                    cursor.execute("SHOW TABLES LIKE 'Onboarding'")
-                    onboarding_table = cursor.fetchone()
+                    st.session_state.transactions = transactions_df
+                    st.success(f"✅ Loaded {len(transactions_df)} transaction records")
+                else:
+                    st.warning("No transaction records found in the selected date range")
+                    st.session_state.transactions = pd.DataFrame()
+                
+                # Load onboarding data
+                st.info("Loading onboarding data...")
+                onboarding_query = """
+                    SELECT 
+                        account_id, full_name, mobile, email, region, district,
+                        town_village, business_name, kyc_status, registration_date,
+                        updated_at, proof_of_id, identification_number,
+                        customer_referrer_code, customer_referrer_mobile,
+                        referrer_entity, entity, bank, bank_account_name,
+                        bank_account_number, status
+                    FROM Onboarding
+                    WHERE registration_date BETWEEN %s AND %s
+                    ORDER BY registration_date
+                """
+                cursor.execute(onboarding_query, (start_date, end_date))
+                onboarding = cursor.fetchall()
+                
+                if onboarding:
+                    onboarding_df = pd.DataFrame(onboarding)
+                    # Parse dates
+                    onboarding_df['registration_date'] = pd.to_datetime(onboarding_df['registration_date'])
+                    onboarding_df['updated_at'] = pd.to_datetime(onboarding_df['updated_at'], errors='coerce')
+                    # Create User Identifier for merging
+                    onboarding_df['user_identifier'] = onboarding_df['mobile'].astype(str).str.strip()
                     
-                    if transaction_table:
-                        cursor.execute("SELECT COUNT(*) as count FROM Transaction LIMIT 1")
-                        transaction_count = cursor.fetchone()
-                    else:
-                        transaction_count = {'count': 0}
-                    
-                    if onboarding_table:
-                        cursor.execute("SELECT COUNT(*) as count FROM Onboarding LIMIT 1")
-                        onboarding_count = cursor.fetchone()
-                    else:
-                        onboarding_count = {'count': 0}
-                    
-                    conn.close()
-                    
-                    return {
-                        'transaction_table_exists': bool(transaction_table),
-                        'onboarding_table_exists': bool(onboarding_table),
-                        'transaction_count': transaction_count['count'] if transaction_count else 0,
-                        'onboarding_count': onboarding_count['count'] if onboarding_count else 0
-                    }
-            return None
+                    st.session_state.onboarding = onboarding_df
+                    st.success(f"✅ Loaded {len(onboarding_df)} onboarding records")
+                else:
+                    st.warning("No onboarding records found in the selected date range")
+                    st.session_state.onboarding = pd.DataFrame()
+            
+            connection.close()
+            st.session_state.data_loaded = True
+            return True
+            
         except Exception as e:
-            st.error(f"Connection test failed: {str(e)}")
-            return None
+            st.error(f"Error loading data: {e}")
+            return False
     
-    def load_transaction_data(self, start_date, end_date):
-        """Load transaction data from MySQL with flexible date range"""
-        try:
-            conn = self.connect_db()
-            if conn:
-                with conn.cursor() as cursor:
-                    # First, let's check if table exists and has data
-                    cursor.execute("SHOW TABLES LIKE 'Transaction'")
-                    table_exists = cursor.fetchone()
-                    
-                    if not table_exists:
-                        st.warning("⚠️ Transaction table not found in database!")
-                        return pd.DataFrame()
-                    
-                    # Check if created_at column exists
-                    cursor.execute("""
-                    SELECT COLUMN_NAME 
-                    FROM INFORMATION_SCHEMA.COLUMNS 
-                    WHERE TABLE_NAME = 'Transaction' 
-                    AND COLUMN_NAME = 'created_at'
-                    """)
-                    created_at_exists = cursor.fetchone()
-                    
-                    if not created_at_exists:
-                        st.warning("⚠️ 'created_at' column not found in Transaction table!")
-                        # Try to load without date filter
-                        query = """
-                        SELECT 
-                            user_identifier,
-                            transaction_id,
-                            sub_transaction_id,
-                            entity_name,
-                            full_name,
-                            created_by,
-                            status,
-                            internal_status,
-                            service_name,
-                            product_name,
-                            transaction_type,
-                            amount,
-                            before_balance,
-                            after_balance,
-                            ucp_name,
-                            wallet_name,
-                            pouch_name,
-                            reference,
-                            error_code,
-                            error_message,
-                            vendor_transaction_id,
-                            vendor_response_code,
-                            vendor_message,
-                            slug,
-                            remarks,
-                            created_at,
-                            business_hierarchy,
-                            parent_user_identifier,
-                            parent_full_name
-                        FROM Transaction
-                        LIMIT 1000
-                        """
-                        cursor.execute(query)
-                    else:
-                        query = """
-                        SELECT 
-                            user_identifier,
-                            transaction_id,
-                            sub_transaction_id,
-                            entity_name,
-                            full_name,
-                            created_by,
-                            status,
-                            internal_status,
-                            service_name,
-                            product_name,
-                            transaction_type,
-                            amount,
-                            before_balance,
-                            after_balance,
-                            ucp_name,
-                            wallet_name,
-                            pouch_name,
-                            reference,
-                            error_code,
-                            error_message,
-                            vendor_transaction_id,
-                            vendor_response_code,
-                            vendor_message,
-                            slug,
-                            remarks,
-                            created_at,
-                            business_hierarchy,
-                            parent_user_identifier,
-                            parent_full_name
-                        FROM Transaction
-                        WHERE created_at BETWEEN %s AND %s
-                        """
-                        cursor.execute(query, (start_date, end_date))
-                    
-                    result = cursor.fetchall()
-                    df = pd.DataFrame(result)
-                    
-                    # Convert data types
-                    if not df.empty:
-                        # Parse dates
-                        if 'created_at' in df.columns:
-                            df['created_at'] = pd.to_datetime(df['created_at'], errors='coerce')
-                        
-                        # Convert numeric columns
-                        numeric_cols = ['amount', 'before_balance', 'after_balance']
-                        for col in numeric_cols:
-                            if col in df.columns:
-                                df[col] = pd.to_numeric(df[col], errors='coerce')
-                        
-                        # Clean text columns
-                        text_columns = ['user_identifier', 'product_name', 'entity_name', 
-                                      'transaction_type', 'ucp_name', 'service_name', 
-                                      'status', 'sub_transaction_id']
-                        for col in text_columns:
-                            if col in df.columns:
-                                df[col] = df[col].astype(str).str.strip()
-                    
-                    # Show data preview
-                    if df.empty:
-                        # Try to get any data from the table to diagnose
-                        cursor.execute("SELECT * FROM Transaction LIMIT 5")
-                        sample = cursor.fetchall()
-                        if sample:
-                            st.info(f"Found {len(sample)} sample records but none in date range {start_date} to {end_date}")
-                    
-                    conn.close()
-                    return df
-            return pd.DataFrame()
-        except Exception as e:
-            st.error(f"Error loading transaction data: {str(e)}")
-            # Try to get error details
-            try:
-                conn = self.connect_db()
-                if conn:
-                    with conn.cursor() as cursor:
-                        cursor.execute("SHOW TABLES")
-                        tables = cursor.fetchall()
-                        st.info(f"Available tables: {[t['Tables_in_bdp_report'] for t in tables]}")
-                        conn.close()
-            except:
-                pass
-            return pd.DataFrame()
-    
-    def load_onboarding_data(self, start_date, end_date):
-        """Load onboarding data from MySQL with flexible date range"""
-        try:
-            conn = self.connect_db()
-            if conn:
-                with conn.cursor() as cursor:
-                    # Check if table exists
-                    cursor.execute("SHOW TABLES LIKE 'Onboarding'")
-                    table_exists = cursor.fetchone()
-                    
-                    if not table_exists:
-                        st.warning("⚠️ Onboarding table not found in database!")
-                        return pd.DataFrame()
-                    
-                    # Check if registration_date column exists
-                    cursor.execute("""
-                    SELECT COLUMN_NAME 
-                    FROM INFORMATION_SCHEMA.COLUMNS 
-                    WHERE TABLE_NAME = 'Onboarding' 
-                    AND COLUMN_NAME = 'registration_date'
-                    """)
-                    reg_date_exists = cursor.fetchone()
-                    
-                    if not reg_date_exists:
-                        st.warning("⚠️ 'registration_date' column not found in Onboarding table!")
-                        # Load without date filter
-                        query = """
-                        SELECT 
-                            account_id,
-                            full_name,
-                            mobile,
-                            email,
-                            region,
-                            district,
-                            town_village,
-                            business_name,
-                            kyc_status,
-                            registration_date,
-                            updated_at,
-                            proof_of_id,
-                            identification_number,
-                            customer_referrer_code,
-                            customer_referrer_mobile,
-                            referrer_entity,
-                            entity,
-                            bank,
-                            bank_account_name,
-                            bank_account_number,
-                            status
-                        FROM Onboarding
-                        LIMIT 1000
-                        """
-                        cursor.execute(query)
-                    else:
-                        query = """
-                        SELECT 
-                            account_id,
-                            full_name,
-                            mobile,
-                            email,
-                            region,
-                            district,
-                            town_village,
-                            business_name,
-                            kyc_status,
-                            registration_date,
-                            updated_at,
-                            proof_of_id,
-                            identification_number,
-                            customer_referrer_code,
-                            customer_referrer_mobile,
-                            referrer_entity,
-                            entity,
-                            bank,
-                            bank_account_name,
-                            bank_account_number,
-                            status
-                        FROM Onboarding
-                        WHERE registration_date BETWEEN %s AND %s
-                        """
-                        cursor.execute(query, (start_date, end_date))
-                    
-                    result = cursor.fetchall()
-                    df = pd.DataFrame(result)
-                    
-                    # Convert data types
-                    if not df.empty:
-                        # Parse dates
-                        if 'registration_date' in df.columns:
-                            df['registration_date'] = pd.to_datetime(df['registration_date'], errors='coerce')
-                        if 'updated_at' in df.columns:
-                            df['updated_at'] = pd.to_datetime(df['updated_at'], errors='coerce')
-                        
-                        # Clean text columns
-                        text_columns = ['mobile', 'status', 'kyc_status', 'entity', 'full_name']
-                        for col in text_columns:
-                            if col in df.columns:
-                                df[col] = df[col].astype(str).str.strip()
-                    
-                    conn.close()
-                    return df
-            return pd.DataFrame()
-        except Exception as e:
-            st.error(f"Error loading onboarding data: {str(e)}")
-            return pd.DataFrame()
-    
-    def calculate_executive_snapshot(self, transactions_df, onboarding_df, period_type='custom'):
-        """Calculate executive snapshot metrics with safe defaults"""
-        metrics = {
-            'new_customers_active': 0,
-            'new_customers_registered': 0,
-            'new_customers_temporary': 0,
-            'new_customers_total': 0,
-            'active_customers_all': 0,
-            'total_transactions': 0,
-            'total_amount': 0,
-            'wau_total': 0,
-            'top_product': 'N/A',
-            'top_product_count': 0,
-            'top_product_amount': 0,
-            'top_product_users': 0,
-            'low_product': 'N/A',
-            'low_product_count': 0,
-            'low_product_amount': 0,
-            'low_product_users': 0
+    def create_date_filters(self):
+        """Create flexible date range filters"""
+        st.sidebar.markdown("### 📅 Date Range Selection")
+        
+        # Date range options
+        date_options = {
+            "Last 7 Days": 7,
+            "Last 30 Days": 30,
+            "Last 90 Days": 90,
+            "This Month": "month",
+            "Last Month": "last_month",
+            "This Quarter": "quarter",
+            "Last Quarter": "last_quarter",
+            "Year to Date": "ytd",
+            "Custom Range": "custom"
         }
         
-        # New registrations by status (from onboarding)
-        if not onboarding_df.empty and 'status' in onboarding_df.columns:
-            try:
-                # Filter for customer entities
-                if 'entity' in onboarding_df.columns:
-                    customer_onboarding = onboarding_df[onboarding_df['entity'] == 'Customer']
-                else:
-                    customer_onboarding = onboarding_df
-                
-                if not customer_onboarding.empty:
-                    status_counts = customer_onboarding['status'].value_counts()
-                    metrics['new_customers_active'] = int(status_counts.get('Active', 0))
-                    metrics['new_customers_registered'] = int(status_counts.get('Registered', 0))
-                    metrics['new_customers_temporary'] = int(status_counts.get('TemporaryRegister', 0))
-                    metrics['new_customers_total'] = int(len(customer_onboarding))
-            except Exception as e:
-                st.warning(f"Error calculating onboarding metrics: {e}")
+        selected_option = st.sidebar.selectbox(
+            "Select Date Range",
+            list(date_options.keys()),
+            index=1
+        )
         
-        # Active customers (from transactions)
-        if not transactions_df.empty and 'entity_name' in transactions_df.columns:
-            try:
-                # Filter successful customer transactions
-                customer_transactions = transactions_df[
-                    (transactions_df['entity_name'] == 'Customer') &
-                    (transactions_df['status'] == 'SUCCESS')
-                ]
-                
-                if not customer_transactions.empty:
-                    # Different thresholds for different period types
-                    if period_type in ['weekly', 'rolling', 'custom']:
-                        threshold = 2
-                    else:  # monthly
-                        threshold = 10
-                    
-                    if 'user_identifier' in customer_transactions.columns:
-                        user_counts = customer_transactions['user_identifier'].value_counts()
-                        active_users = user_counts[user_counts >= threshold].index.tolist()
-                        metrics['active_customers_all'] = len(active_users)
-                    
-                    # Total transactions
-                    metrics['total_transactions'] = len(customer_transactions)
-                    
-                    # Total amount
-                    if 'amount' in customer_transactions.columns:
-                        metrics['total_amount'] = float(customer_transactions['amount'].sum())
-            except Exception as e:
-                st.warning(f"Error calculating transaction metrics: {e}")
+        today = datetime.now()
         
-        # WAU calculation (Weekly Active Users from new customers)
-        try:
-            if metrics['new_customers_total'] > 0:
-                if not onboarding_df.empty and not transactions_df.empty:
-                    if 'mobile' in onboarding_df.columns and 'user_identifier' in transactions_df.columns:
-                        new_customer_ids = onboarding_df['mobile'].dropna().unique()
-                        wau_customers = transactions_df[
-                            (transactions_df['user_identifier'].isin(new_customer_ids)) &
-                            (transactions_df['status'] == 'SUCCESS')
-                        ]['user_identifier'].nunique()
-                        metrics['wau_total'] = int(wau_customers)
-        except:
-            metrics['wau_total'] = 0
-        
-        # Top and low performing products
-        if not transactions_df.empty and 'product_name' in transactions_df.columns:
-            try:
-                # Filter successful customer transactions
-                product_transactions = transactions_df[
-                    (transactions_df['entity_name'] == 'Customer') &
-                    (transactions_df['status'] == 'SUCCESS') &
-                    (transactions_df['product_name'].notna())
-                ]
-                
-                if not product_transactions.empty and 'product_name' in product_transactions.columns:
-                    product_counts = product_transactions['product_name'].value_counts()
-                    
-                    if not product_counts.empty:
-                        metrics['top_product'] = str(product_counts.index[0])
-                        metrics['top_product_count'] = int(product_counts.iloc[0])
-                        
-                        # Get product amount and users
-                        top_product_transactions = product_transactions[
-                            product_transactions['product_name'] == metrics['top_product']
-                        ]
-                        if 'amount' in top_product_transactions.columns:
-                            metrics['top_product_amount'] = float(top_product_transactions['amount'].sum())
-                        if 'user_identifier' in top_product_transactions.columns:
-                            metrics['top_product_users'] = top_product_transactions['user_identifier'].nunique()
-                        
-                        # Find lowest performing active product
-                        active_products = product_counts[product_counts > 0]
-                        if not active_products.empty:
-                            metrics['low_product'] = str(active_products.index[-1])
-                            metrics['low_product_count'] = int(active_products.iloc[-1])
-                            
-                            # Get low product amount and users
-                            low_product_transactions = product_transactions[
-                                product_transactions['product_name'] == metrics['low_product']
-                            ]
-                            if 'amount' in low_product_transactions.columns:
-                                metrics['low_product_amount'] = float(low_product_transactions['amount'].sum())
-                            if 'user_identifier' in low_product_transactions.columns:
-                                metrics['low_product_users'] = low_product_transactions['user_identifier'].nunique()
-            except Exception as e:
-                st.warning(f"Error calculating product metrics: {e}")
-        
-        return metrics
-    
-    def calculate_customer_acquisition(self, transactions_df, onboarding_df):
-        """Calculate customer acquisition metrics with safe defaults"""
-        metrics = {
-            'new_registrations_active': 0,
-            'new_registrations_registered': 0,
-            'new_registrations_temporary': 0,
-            'new_registrations_total': 0,
-            'kyc_completed': 0,
-            'ftt': 0,
-            'ftt_rate': 0,
-            'total_transacting_customers': 0
-        }
-        
-        # Filter for customer entities
-        if not onboarding_df.empty:
-            try:
-                if 'entity' in onboarding_df.columns:
-                    customer_onboarding = onboarding_df[onboarding_df['entity'] == 'Customer']
-                else:
-                    customer_onboarding = onboarding_df
-            except:
-                customer_onboarding = pd.DataFrame()
+        if selected_option == "Custom Range":
+            col1, col2 = st.sidebar.columns(2)
+            with col1:
+                start_date = st.date_input(
+                    "Start Date",
+                    value=today - timedelta(days=30),
+                    max_value=today
+                )
+            with col2:
+                end_date = st.date_input(
+                    "End Date",
+                    value=today,
+                    min_value=start_date,
+                    max_value=today
+                )
         else:
-            customer_onboarding = pd.DataFrame()
+            days = date_options[selected_option]
+            
+            if days == "month":
+                start_date = today.replace(day=1)
+                end_date = today
+            elif days == "last_month":
+                first_day = (today.replace(day=1) - timedelta(days=1)).replace(day=1)
+                last_day = today.replace(day=1) - timedelta(days=1)
+                start_date = first_day
+                end_date = last_day
+            elif days == "quarter":
+                current_quarter = (today.month - 1) // 3 + 1
+                start_date = datetime(today.year, 3 * current_quarter - 2, 1)
+                end_date = today
+            elif days == "last_quarter":
+                current_quarter = (today.month - 1) // 3 + 1
+                last_quarter = current_quarter - 1 if current_quarter > 1 else 4
+                year = today.year if current_quarter > 1 else today.year - 1
+                start_date = datetime(year, 3 * last_quarter - 2, 1)
+                if last_quarter == 4:
+                    end_date = datetime(year + 1, 1, 1) - timedelta(days=1)
+                else:
+                    end_date = datetime(year, 3 * last_quarter + 1, 1) - timedelta(days=1)
+            elif days == "ytd":
+                start_date = datetime(today.year, 1, 1)
+                end_date = today
+            else:
+                start_date = today - timedelta(days=days)
+                end_date = today
         
-        # New registrations by status
-        if not customer_onboarding.empty and 'status' in customer_onboarding.columns:
-            try:
-                status_counts = customer_onboarding['status'].value_counts()
-                metrics['new_registrations_active'] = int(status_counts.get('Active', 0))
-                metrics['new_registrations_registered'] = int(status_counts.get('Registered', 0))
-                metrics['new_registrations_temporary'] = int(status_counts.get('TemporaryRegister', 0))
-                metrics['new_registrations_total'] = int(len(customer_onboarding))
-            except:
-                pass
+        # Convert to datetime
+        start_datetime = datetime.combine(start_date, datetime.min.time())
+        end_datetime = datetime.combine(end_date, datetime.max.time())
         
-        # KYC Completed
-        if not customer_onboarding.empty and 'kyc_status' in customer_onboarding.columns:
-            try:
-                kyc_completed = customer_onboarding[customer_onboarding['kyc_status'].str.upper() == 'VERIFIED']
-                metrics['kyc_completed'] = len(kyc_completed)
-            except:
-                pass
+        return start_datetime, end_datetime
+    
+    def create_product_filters(self):
+        """Create product category filters"""
+        st.sidebar.markdown("### 📊 Product Filters")
         
-        # First-Time Transactors (FTT)
-        if not customer_onboarding.empty and not transactions_df.empty:
-            try:
-                if 'mobile' in customer_onboarding.columns and 'user_identifier' in transactions_df.columns:
-                    new_customer_mobiles = customer_onboarding['mobile'].dropna().unique()
-                    
-                    successful_transactions = transactions_df[
-                        (transactions_df['status'] == 'SUCCESS') &
-                        (transactions_df['entity_name'] == 'Customer')
-                    ]
-                    
-                    if len(new_customer_mobiles) > 0 and not successful_transactions.empty:
-                        transacting_users = successful_transactions['user_identifier'].unique()
-                        ftt = len(set(new_customer_mobiles) & set(transacting_users))
-                        metrics['ftt'] = ftt
-            except:
-                pass
+        all_categories = list(self.product_categories.keys()) + ['Airtime Topup']
+        selected_categories = st.sidebar.multiselect(
+            "Select Product Categories",
+            all_categories,
+            default=all_categories
+        )
         
-        # FTT Rate
-        if metrics['new_registrations_total'] > 0:
-            metrics['ftt_rate'] = (metrics['ftt'] / metrics['new_registrations_total']) * 100
+        # Get products from selected categories
+        selected_products = []
+        for category in selected_categories:
+            if category == 'Airtime Topup':
+                selected_products.append('Airtime Topup')
+            else:
+                selected_products.extend(self.product_categories.get(category, []))
         
-        # Total transacting customers
-        if not transactions_df.empty:
-            try:
-                total_transacting_customers = transactions_df[
-                    transactions_df['entity_name'] == 'Customer'
-                ]['user_identifier'].nunique()
-                metrics['total_transacting_customers'] = total_transacting_customers
-            except:
-                pass
+        return selected_products if selected_products else self.all_products
+    
+    def create_metric_card(self, title, value, change=None, format_func=None):
+        """Create a metric card with optional change indicator"""
+        if format_func:
+            display_value = format_func(value)
+        else:
+            display_value = f"{value:,.0f}" if isinstance(value, (int, float)) else str(value)
+        
+        html = f"""
+        <div class="metric-card">
+            <div class="metric-label">{title}</div>
+            <div class="metric-value">{display_value}</div>
+        """
+        
+        if change is not None:
+            if change > 0:
+                trend_class = "trend-up"
+                trend_symbol = "↗"
+            elif change < 0:
+                trend_class = "trend-down"
+                trend_symbol = "↘"
+            else:
+                trend_class = "trend-neutral"
+                trend_symbol = "→"
+            
+            html += f"""
+            <div class="{trend_class}" style="margin-top: 0.5rem;">
+                {trend_symbol} {abs(change):.1f}%
+            </div>
+            """
+        
+        html += "</div>"
+        return html
+    
+    def calculate_executive_snapshot(self, start_date, end_date, transactions_df, onboarding_df):
+        """Calculate executive snapshot metrics"""
+        metrics = {}
+        
+        # Filter data for the period
+        period_transactions = transactions_df[
+            (transactions_df['created_at'] >= start_date) & 
+            (transactions_df['created_at'] <= end_date)
+        ]
+        
+        period_onboarding = onboarding_df[
+            (onboarding_df['registration_date'] >= start_date) & 
+            (onboarding_df['registration_date'] <= end_date)
+        ]
+        
+        # New Customers by Status
+        if not period_onboarding.empty and 'status' in period_onboarding.columns:
+            status_counts = period_onboarding[period_onboarding['entity'] == 'Customer']['status'].value_counts()
+            metrics['new_customers_active'] = status_counts.get('Active', 0)
+            metrics['new_customers_registered'] = status_counts.get('Registered', 0)
+            metrics['new_customers_temporary'] = status_counts.get('TemporaryRegister', 0)
+            metrics['new_customers_total'] = period_onboarding[period_onboarding['entity'] == 'Customer']['account_id'].nunique()
+        else:
+            metrics['new_customers_active'] = 0
+            metrics['new_customers_registered'] = 0
+            metrics['new_customers_temporary'] = 0
+            metrics['new_customers_total'] = 0
+        
+        # Active Customers (customers with successful transactions)
+        if not period_transactions.empty:
+            customer_transactions = period_transactions[
+                (period_transactions['entity_name'] == 'Customer') &
+                (period_transactions['status'] == 'SUCCESS')
+            ]
+            
+            if not customer_transactions.empty:
+                user_transaction_counts = customer_transactions.groupby('user_identifier').size()
+                active_customers = user_transaction_counts[user_transaction_counts >= 2].index.tolist()
+                metrics['active_customers'] = len(active_customers)
+            else:
+                metrics['active_customers'] = 0
+        else:
+            metrics['active_customers'] = 0
+        
+        # Transaction Volume and Value
+        if not period_transactions.empty:
+            successful_transactions = period_transactions[period_transactions['status'] == 'SUCCESS']
+            metrics['total_transactions'] = len(successful_transactions)
+            metrics['transaction_value'] = successful_transactions['amount'].sum()
+        else:
+            metrics['total_transactions'] = 0
+            metrics['transaction_value'] = 0
+        
+        # Top Product
+        if not period_transactions.empty:
+            product_counts = period_transactions[
+                (period_transactions['status'] == 'SUCCESS') &
+                (period_transactions['entity_name'] == 'Customer')
+            ]['product_name'].value_counts()
+            
+            if not product_counts.empty:
+                metrics['top_product'] = product_counts.index[0]
+                metrics['top_product_count'] = int(product_counts.iloc[0])
+            else:
+                metrics['top_product'] = 'N/A'
+                metrics['top_product_count'] = 0
+        else:
+            metrics['top_product'] = 'N/A'
+            metrics['top_product_count'] = 0
         
         return metrics
-    
-    def calculate_product_metrics(self, transactions_df):
-        """Calculate product usage metrics"""
-        if transactions_df.empty:
-            return {}
-        
-        product_metrics = {}
-        
-        # Process regular products
-        for category, products in self.product_categories.items():
-            for product in products:
-                try:
-                    if product == 'Internal Wallet Transfer':
-                        # P2P special handling
-                        product_trans = transactions_df[
-                            (transactions_df['product_name'] == 'Internal Wallet Transfer') &
-                            (transactions_df['entity_name'] == 'Customer') &
-                            (transactions_df['status'] == 'SUCCESS') &
-                            (transactions_df['transaction_type'] == 'DR')
-                        ]
-                        
-                        # Exclude fee transactions
-                        if 'ucp_name' in product_trans.columns:
-                            product_trans = product_trans[
-                                ~product_trans['ucp_name'].astype(str).str.contains('Fee', case=False, na=False)
-                            ]
-                    else:
-                        product_trans = transactions_df[
-                            (transactions_df['product_name'] == product) &
-                            (transactions_df['entity_name'] == 'Customer') &
-                            (transactions_df['status'] == 'SUCCESS')
-                        ]
-                    
-                    if not product_trans.empty:
-                        total_transactions = len(product_trans)
-                        total_amount = product_trans['amount'].sum() if 'amount' in product_trans.columns else 0
-                        total_users = product_trans['user_identifier'].nunique() if 'user_identifier' in product_trans.columns else 0
-                        avg_amount = total_amount / total_transactions if total_transactions > 0 else 0
-                        
-                        # Active users
-                        if 'user_identifier' in product_trans.columns:
-                            user_counts = product_trans['user_identifier'].value_counts()
-                            active_users = len(user_counts[user_counts >= 2])
-                        else:
-                            active_users = 0
-                        
-                        product_metrics[product] = {
-                            'category': category,
-                            'total_transactions': int(total_transactions),
-                            'total_amount': float(total_amount),
-                            'avg_amount': float(avg_amount),
-                            'total_users': int(total_users),
-                            'active_users': int(active_users),
-                            'avg_transactions_per_user': total_transactions / total_users if total_users > 0 else 0
-                        }
-                except:
-                    # Skip this product if there's an error
-                    continue
-        
-        # Process Airtime Topup (Service)
-        for service in self.services:
-            try:
-                service_trans = transactions_df[
-                    (transactions_df['service_name'] == 'Airtime Topup') &
-                    (transactions_df['entity_name'] == 'Customer') &
-                    (transactions_df['status'] == 'SUCCESS') &
-                    (transactions_df['transaction_type'] == 'DR')
-                ]
-                
-                if not service_trans.empty:
-                    total_transactions = len(service_trans)
-                    total_amount = service_trans['amount'].sum() if 'amount' in service_trans.columns else 0
-                    total_users = service_trans['user_identifier'].nunique() if 'user_identifier' in service_trans.columns else 0
-                    avg_amount = total_amount / total_transactions if total_transactions > 0 else 0
-                    
-                    # Active users
-                    if 'user_identifier' in service_trans.columns:
-                        user_counts = service_trans['user_identifier'].value_counts()
-                        active_users = len(user_counts[user_counts >= 2])
-                    else:
-                        active_users = 0
-                    
-                    product_metrics[service] = {
-                        'category': 'Airtime Topup',
-                        'total_transactions': int(total_transactions),
-                        'total_amount': float(total_amount),
-                        'avg_amount': float(avg_amount),
-                        'total_users': int(total_users),
-                        'active_users': int(active_users),
-                        'avg_transactions_per_user': total_transactions / total_users if total_users > 0 else 0
-                    }
-            except:
-                continue
-        
-        return product_metrics
-    
-    def create_period_selector(self):
-        """Create flexible date range selector"""
-        st.markdown('<h3 class="sub-header">📅 Select Analysis Period</h3>', 
-                   unsafe_allow_html=True)
-        
-        col1, col2, col3 = st.columns([1, 1, 2])
-        
-        with col1:
-            period_type = st.selectbox(
-                "Select Period Type",
-                ["Custom Range", "Last 7 Days", "Last 30 Days", "Last 90 Days", 
-                 "This Month", "Last Month", "This Quarter", "Last Quarter",
-                 "Last 6 Months", "Year to Date", "Last Year"],
-                index=0
-            )
-        
-        with col2:
-            if period_type == "Custom Range":
-                start_date = st.date_input("Start Date", value=self.today - timedelta(days=30))
-                end_date = st.date_input("End Date", value=self.today)
-            elif period_type == "Last 7 Days":
-                start_date = self.today - timedelta(days=7)
-                end_date = self.today
-                st.write(f"**Period:** Last 7 Days")
-            elif period_type == "Last 30 Days":
-                start_date = self.today - timedelta(days=30)
-                end_date = self.today
-                st.write(f"**Period:** Last 30 Days")
-            elif period_type == "Last 90 Days":
-                start_date = self.today - timedelta(days=90)
-                end_date = self.today
-                st.write(f"**Period:** Last 90 Days")
-            elif period_type == "This Month":
-                start_date = datetime(self.today.year, self.today.month, 1)
-                end_date = self.today
-                st.write(f"**Period:** This Month")
-            elif period_type == "Last Month":
-                if self.today.month == 1:
-                    start_date = datetime(self.today.year - 1, 12, 1)
-                else:
-                    start_date = datetime(self.today.year, self.today.month - 1, 1)
-                end_date = start_date + relativedelta(months=1, days=-1)
-                st.write(f"**Period:** Last Month")
-            elif period_type == "This Quarter":
-                quarter = (self.today.month - 1) // 3 + 1
-                start_date = datetime(self.today.year, 3 * quarter - 2, 1)
-                end_date = self.today
-                st.write(f"**Period:** This Quarter (Q{quarter})")
-            elif period_type == "Last Quarter":
-                quarter = (self.today.month - 1) // 3
-                if quarter == 0:
-                    start_date = datetime(self.today.year - 1, 10, 1)
-                else:
-                    start_date = datetime(self.today.year, 3 * quarter - 2, 1)
-                end_date = start_date + relativedelta(months=3, days=-1)
-                st.write(f"**Period:** Last Quarter (Q{quarter})")
-            elif period_type == "Last 6 Months":
-                start_date = self.today - timedelta(days=180)
-                end_date = self.today
-                st.write(f"**Period:** Last 6 Months")
-            elif period_type == "Year to Date":
-                start_date = datetime(self.today.year, 1, 1)
-                end_date = self.today
-                st.write(f"**Period:** Year to Date")
-            elif period_type == "Last Year":
-                start_date = datetime(self.today.year - 1, 1, 1)
-                end_date = datetime(self.today.year - 1, 12, 31)
-                st.write(f"**Period:** Last Year")
-        
-        with col3:
-            st.markdown("### Date Range Summary")
-            st.markdown(f"""
-            <div class="metric-card">
-                <p><strong>From:</strong> {start_date.strftime('%B %d, %Y')}</p>
-                <p><strong>To:</strong> {end_date.strftime('%B %d, %Y')}</p>
-                <p><strong>Days Covered:</strong> {(end_date - start_date).days + 1}</p>
-            </div>
-            """, unsafe_allow_html=True)
-        
-        return start_date, end_date, period_type
     
     def display_executive_snapshot(self, metrics):
-        """Display executive snapshot metrics with safe handling"""
-        st.markdown("### 📊 Executive Snapshot")
+        """Display executive snapshot metrics"""
+        st.markdown('<div class="sub-header">📈 Executive Snapshot</div>', unsafe_allow_html=True)
         
         col1, col2, col3, col4 = st.columns(4)
         
         with col1:
-            st.metric(
-                label="New Customers",
-                value=f"{metrics.get('new_customers_total', 0):,}",
-                delta=f"{metrics.get('new_customers_active', 0):,} Active",
-                delta_color="normal"
-            )
+            st.markdown(self.create_metric_card(
+                "New Customers",
+                metrics['new_customers_total']
+            ), unsafe_allow_html=True)
         
         with col2:
-            st.metric(
-                label="Active Customers",
-                value=f"{metrics.get('active_customers_all', 0):,}",
-                delta=None
-            )
+            st.markdown(self.create_metric_card(
+                "Active Customers",
+                metrics['active_customers']
+            ), unsafe_allow_html=True)
         
         with col3:
-            st.metric(
-                label="Total Transactions",
-                value=f"{metrics.get('total_transactions', 0):,}",
-                delta=f"${metrics.get('total_amount', 0):,.0f}",
-                delta_color="off"
-            )
+            st.markdown(self.create_metric_card(
+                "Total Transactions",
+                metrics['total_transactions']
+            ), unsafe_allow_html=True)
         
         with col4:
-            top_product = metrics.get('top_product', 'N/A')
-            top_count = metrics.get('top_product_count', 0)
-            st.metric(
-                label="Top Product",
-                value=str(top_product)[:15] + "..." if len(str(top_product)) > 15 else str(top_product),
-                delta=f"{top_count:,} txn" if top_product != 'N/A' else "N/A"
-            )
+            st.markdown(self.create_metric_card(
+                "Transaction Value",
+                metrics['transaction_value'],
+                format_func=lambda x: f"₦{x:,.0f}"
+            ), unsafe_allow_html=True)
         
-        # Second row of metrics
+        # Additional metrics row
         col1, col2, col3, col4 = st.columns(4)
         
         with col1:
-            st.metric(
-                label="WAU",
-                value=f"{metrics.get('wau_total', 0):,}",
-                delta=None
-            )
+            st.markdown(self.create_metric_card(
+                "Active Status",
+                metrics['new_customers_active']
+            ), unsafe_allow_html=True)
         
         with col2:
-            low_product = metrics.get('low_product', 'N/A')
-            low_count = metrics.get('low_product_count', 0)
-            st.metric(
-                label="Lowest Product",
-                value=str(low_product)[:15] + "..." if len(str(low_product)) > 15 else str(low_product),
-                delta=f"{low_count:,} txn" if low_product != 'N/A' else "N/A"
-            )
+            st.markdown(self.create_metric_card(
+                "Registered Status",
+                metrics['new_customers_registered']
+            ), unsafe_allow_html=True)
         
         with col3:
-            st.metric(
-                label="Top Product Users",
-                value=f"{metrics.get('top_product_users', 0):,}",
-                delta=f"${metrics.get('top_product_amount', 0):,.0f}",
-                delta_color="off"
-            )
+            st.markdown(self.create_metric_card(
+                "Temporary Status",
+                metrics['new_customers_temporary']
+            ), unsafe_allow_html=True)
         
         with col4:
-            if metrics.get('low_product') != 'N/A':
-                st.metric(
-                    label="Low Product Users",
-                    value=f"{metrics.get('low_product_users', 0):,}",
-                    delta=f"${metrics.get('low_product_amount', 0):,.0f}",
-                    delta_color="off"
-                )
-            else:
-                st.metric(
-                    label="Low Product Users",
-                    value="0",
-                    delta="N/A"
-                )
-        
-        # Detailed breakdown
-        with st.expander("📋 View Detailed Breakdown", expanded=False):
-            col1, col2, col3 = st.columns(3)
-            
-            with col1:
-                st.markdown("**New Customers by Status:**")
-                st.write(f"• **Active:** {metrics.get('new_customers_active', 0):,}")
-                st.write(f"• **Registered:** {metrics.get('new_customers_registered', 0):,}")
-                st.write(f"• **Temporary:** {metrics.get('new_customers_temporary', 0):,}")
-                st.write(f"• **Total:** {metrics.get('new_customers_total', 0):,}")
-            
-            with col2:
-                st.markdown("**Transaction Summary:**")
-                st.write(f"• **Total Transactions:** {metrics.get('total_transactions', 0):,}")
-                st.write(f"• **Total Amount:** ${metrics.get('total_amount', 0):,.2f}")
-                st.write(f"• **Active Customers:** {metrics.get('active_customers_all', 0):,}")
-                st.write(f"• **WAU:** {metrics.get('wau_total', 0):,}")
-            
-            with col3:
-                st.markdown("**Product Performance:**")
-                if metrics.get('top_product') != 'N/A':
-                    st.write(f"• **Top Product:** {metrics.get('top_product', 'N/A')}")
-                    st.write(f"  - Transactions: {metrics.get('top_product_count', 0):,}")
-                    st.write(f"  - Users: {metrics.get('top_product_users', 0):,}")
-                    st.write(f"  - Amount: ${metrics.get('top_product_amount', 0):,.2f}")
-                
-                if metrics.get('low_product') != 'N/A':
-                    st.write(f"• **Lowest Product:** {metrics.get('low_product', 'N/A')}")
-                    st.write(f"  - Transactions: {metrics.get('low_product_count', 0):,}")
-                    st.write(f"  - Users: {metrics.get('low_product_users', 0):,}")
-                    st.write(f"  - Amount: ${metrics.get('low_product_amount', 0):,.2f}")
+            product_text = f"{metrics['top_product'][:15]}..." if len(str(metrics['top_product'])) > 15 else metrics['top_product']
+            st.markdown(self.create_metric_card(
+                "Top Product",
+                f"{product_text} ({metrics['top_product_count']})"
+            ), unsafe_allow_html=True)
     
-    def display_customer_acquisition(self, metrics):
-        """Display customer acquisition metrics"""
-        st.markdown("### 👥 Customer Acquisition")
+    def display_product_performance(self, transactions_df, selected_products):
+        """Display product performance analysis"""
+        st.markdown('<div class="sub-header">📊 Product Performance</div>', unsafe_allow_html=True)
         
-        col1, col2, col3, col4 = st.columns(4)
+        # Filter successful customer transactions
+        customer_transactions = transactions_df[
+            (transactions_df['entity_name'] == 'Customer') &
+            (transactions_df['status'] == 'SUCCESS')
+        ]
         
-        with col1:
-            st.metric(
-                label="New Registrations",
-                value=f"{metrics.get('new_registrations_total', 0):,}",
-                delta=f"{metrics.get('new_registrations_active', 0):,} Active"
-            )
-        
-        with col2:
-            st.metric(
-                label="KYC Completed",
-                value=f"{metrics.get('kyc_completed', 0):,}",
-                delta=None
-            )
-        
-        with col3:
-            st.metric(
-                label="First-Time Transactors",
-                value=f"{metrics.get('ftt', 0):,}",
-                delta=None
-            )
-        
-        with col4:
-            ftt_rate = metrics.get('ftt_rate', 0)
-            st.metric(
-                label="FTT Rate",
-                value=f"{ftt_rate:.1f}%",
-                delta=None
-            )
-        
-        # Additional metrics
-        col1, col2, col3, col4 = st.columns(4)
-        
-        with col1:
-            st.metric(
-                label="Registered",
-                value=f"{metrics.get('new_registrations_registered', 0):,}",
-                delta=None
-            )
-        
-        with col2:
-            st.metric(
-                label="Temporary",
-                value=f"{metrics.get('new_registrations_temporary', 0):,}",
-                delta=None
-            )
-        
-        with col3:
-            st.metric(
-                label="Total Transacting",
-                value=f"{metrics.get('total_transacting_customers', 0):,}",
-                delta=None
-            )
-        
-        with col4:
-            if metrics.get('new_registrations_total', 0) > 0:
-                kyc_rate = (metrics.get('kyc_completed', 0) / metrics.get('new_registrations_total', 1)) * 100
-                st.metric(
-                    label="KYC Rate",
-                    value=f"{kyc_rate:.1f}%",
-                    delta=None
-                )
-    
-    def display_product_analysis(self, product_metrics):
-        """Display product analysis"""
-        st.markdown("### 📈 Product Performance Analysis")
-        
-        if not product_metrics:
-            st.info("📭 No product transaction data available for the selected period.")
+        if customer_transactions.empty:
+            st.info("No transaction data available for the selected period")
             return
         
-        # Convert to DataFrame
+        # Prepare product performance data
         product_data = []
-        for product, metrics in product_metrics.items():
-            product_data.append({
-                'Product': product,
-                'Category': metrics.get('category', ''),
-                'Transactions': metrics.get('total_transactions', 0),
-                'Amount ($)': metrics.get('total_amount', 0),
-                'Avg Amount ($)': metrics.get('avg_amount', 0),
-                'Total Users': metrics.get('total_users', 0),
-                'Active Users': metrics.get('active_users', 0),
-                'Avg Txns/User': metrics.get('avg_transactions_per_user', 0)
-            })
+        for product in selected_products:
+            if product == 'Airtime Topup':
+                product_trans = customer_transactions[
+                    (customer_transactions['service_name'] == 'Airtime Topup') &
+                    (customer_transactions['transaction_type'] == 'DR')
+                ]
+            elif product == 'Internal Wallet Transfer':
+                product_trans = customer_transactions[
+                    (customer_transactions['product_name'] == 'Internal Wallet Transfer') &
+                    (customer_transactions['transaction_type'] == 'DR')
+                ]
+                # Exclude fee transactions
+                if 'ucp_name' in product_trans.columns:
+                    product_trans = product_trans[
+                        ~product_trans['ucp_name'].str.contains('Fee', case=False, na=False)
+                    ]
+            else:
+                product_trans = customer_transactions[
+                    customer_transactions['product_name'] == product
+                ]
+            
+            if not product_trans.empty:
+                product_data.append({
+                    'Product': product,
+                    'Transactions': len(product_trans),
+                    'Unique Users': product_trans['user_identifier'].nunique(),
+                    'Total Amount': product_trans['amount'].sum(),
+                    'Avg Amount': product_trans['amount'].mean()
+                })
         
-        df = pd.DataFrame(product_data)
-        
-        # Display in tabs
-        tab1, tab2 = st.tabs(["📋 Metrics Table", "📊 Visualizations"])
-        
-        with tab1:
-            if not df.empty:
-                # Sort by transactions
-                df_sorted = df.sort_values('Transactions', ascending=False)
-                
-                st.dataframe(
-                    df_sorted,
-                    column_config={
-                        "Product": st.column_config.TextColumn("Product", width="medium"),
-                        "Category": st.column_config.TextColumn("Category", width="medium"),
-                        "Transactions": st.column_config.NumberColumn("Transactions", format="%,d"),
-                        "Amount ($)": st.column_config.NumberColumn("Amount", format="$%,.2f"),
-                        "Avg Amount ($)": st.column_config.NumberColumn("Avg Amount", format="$%,.2f"),
-                        "Total Users": st.column_config.NumberColumn("Users", format="%,d"),
-                        "Active Users": st.column_config.NumberColumn("Active Users", format="%,d"),
-                        "Avg Txns/User": st.column_config.NumberColumn("Avg Txns/User", format="%.2f")
-                    },
-                    hide_index=True,
-                    use_container_width=True
+        if product_data:
+            product_df = pd.DataFrame(product_data)
+            
+            # Display in columns
+            col1, col2 = st.columns([3, 2])
+            
+            with col1:
+                # Transactions by product
+                fig = px.bar(
+                    product_df.sort_values('Transactions', ascending=False).head(10),
+                    x='Product',
+                    y='Transactions',
+                    title='Top 10 Products by Transaction Count',
+                    color='Transactions',
+                    color_continuous_scale='Blues'
                 )
-            else:
-                st.info("No product data to display")
+                fig.update_layout(
+                    xaxis_title="Product",
+                    yaxis_title="Number of Transactions",
+                    height=400,
+                    showlegend=False
+                )
+                st.plotly_chart(fig, use_container_width=True)
+            
+            with col2:
+                # Product summary table
+                st.markdown("**Product Performance Summary**")
+                summary_df = product_df.sort_values('Transactions', ascending=False)
+                summary_df = summary_df[['Product', 'Transactions', 'Unique Users', 'Total Amount']]
+                summary_df['Total Amount'] = summary_df['Total Amount'].apply(lambda x: f"₦{x:,.0f}")
+                st.dataframe(
+                    summary_df,
+                    use_container_width=True,
+                    hide_index=True
+                )
+            
+            # Amount by product
+            st.markdown("---")
+            col1, col2 = st.columns([2, 1])
+            
+            with col1:
+                fig2 = px.pie(
+                    product_df,
+                    values='Total Amount',
+                    names='Product',
+                    title='Transaction Value Distribution by Product',
+                    hole=0.3
+                )
+                fig2.update_traces(textposition='inside', textinfo='percent+label')
+                st.plotly_chart(fig2, use_container_width=True)
+            
+            with col2:
+                # Key metrics
+                st.markdown("**Key Metrics**")
+                avg_trans_per_user = product_df['Transactions'].sum() / product_df['Unique Users'].sum() if product_df['Unique Users'].sum() > 0 else 0
+                st.metric("Avg Transactions per User", f"{avg_trans_per_user:.1f}")
+                st.metric("Total Unique Product Users", f"{product_df['Unique Users'].sum():,.0f}")
+                st.metric("Overall Transaction Value", f"₦{product_df['Total Amount'].sum():,.0f}")
+    
+    def display_customer_acquisition(self, onboarding_df):
+        """Display customer acquisition metrics"""
+        st.markdown('<div class="sub-header">👥 Customer Acquisition</div>', unsafe_allow_html=True)
         
-        with tab2:
-            if not df.empty:
-                df_sorted = df.sort_values('Transactions', ascending=False)
-                
-                col1, col2 = st.columns(2)
-                
-                with col1:
-                    # Top products by transactions
-                    top_products = df_sorted.head(10)
-                    if not top_products.empty:
-                        fig = px.bar(top_products, 
-                                   x='Product', y='Transactions',
-                                   title='Top Products by Transactions',
-                                   color='Category',
-                                   text='Transactions')
-                        fig.update_traces(texttemplate='%{text:,}', textposition='outside')
-                        fig.update_layout(xaxis_tickangle=-45, showlegend=True)
-                        st.plotly_chart(fig, use_container_width=True)
-                
-                with col2:
-                    # Products by users
-                    if not top_products.empty:
-                        fig = px.bar(top_products, 
-                                   x='Product', y='Total Users',
-                                   title='Top Products by Users',
-                                   color='Category',
-                                   text='Total Users')
-                        fig.update_traces(texttemplate='%{text:,}', textposition='outside')
-                        fig.update_layout(xaxis_tickangle=-45, showlegend=True)
-                        st.plotly_chart(fig, use_container_width=True)
-                
-                # Amount by category
-                category_amount = df.groupby('Category')['Amount ($)'].sum().reset_index()
-                if not category_amount.empty:
-                    fig = px.pie(category_amount, values='Amount ($)', names='Category',
-                               title='Transaction Amount by Category',
-                               hole=0.3)
-                    st.plotly_chart(fig, use_container_width=True)
-            else:
-                st.info("No visualization data available")
+        if onboarding_df.empty:
+            st.info("No onboarding data available for the selected period")
+            return
+        
+        # Filter for customers only
+        customer_onboarding = onboarding_df[onboarding_df['entity'] == 'Customer']
+        
+        if customer_onboarding.empty:
+            st.info("No customer onboarding data available")
+            return
+        
+        col1, col2, col3 = st.columns(3)
+        
+        with col1:
+            # Registration trend
+            daily_registrations = customer_onboarding.set_index('registration_date').resample('D').size()
+            fig = px.line(
+                x=daily_registrations.index,
+                y=daily_registrations.values,
+                title='Daily Customer Registrations',
+                labels={'x': 'Date', 'y': 'Registrations'}
+            )
+            fig.update_layout(height=300)
+            st.plotly_chart(fig, use_container_width=True)
+        
+        with col2:
+            # Status distribution
+            if 'status' in customer_onboarding.columns:
+                status_counts = customer_onboarding['status'].value_counts()
+                fig = px.pie(
+                    values=status_counts.values,
+                    names=status_counts.index,
+                    title='Customer Status Distribution',
+                    hole=0.3
+                )
+                fig.update_traces(textposition='inside', textinfo='percent+label')
+                fig.update_layout(height=300)
+                st.plotly_chart(fig, use_container_width=True)
+        
+        with col3:
+            # KYC Status
+            if 'kyc_status' in customer_onboarding.columns:
+                kyc_counts = customer_onboarding['kyc_status'].value_counts()
+                st.markdown("**KYC Status**")
+                for status, count in kyc_counts.items():
+                    st.progress(
+                        count / len(customer_onboarding) if len(customer_onboarding) > 0 else 0,
+                        text=f"{status}: {count} ({count/len(customer_onboarding)*100:.1f}%)" if len(customer_onboarding) > 0 else f"{status}: {count}"
+                    )
+            
+            # Metrics
+            st.metric("Total Registrations", f"{len(customer_onboarding):,.0f}")
+            if 'kyc_status' in customer_onboarding.columns:
+                verified_count = customer_onboarding[customer_onboarding['kyc_status'].str.upper() == 'VERIFIED'].shape[0]
+                st.metric("KYC Verified", f"{verified_count:,}")
     
     def display_transaction_analysis(self, transactions_df):
         """Display transaction analysis"""
-        st.markdown("### 💰 Transaction Analysis")
+        st.markdown('<div class="sub-header">💳 Transaction Analysis</div>', unsafe_allow_html=True)
         
         if transactions_df.empty:
-            st.info("📭 No transaction data available for the selected period.")
+            st.info("No transaction data available for the selected period")
             return
         
-        # Summary metrics
-        total_transactions = len(transactions_df)
+        # Filter successful transactions
+        successful_transactions = transactions_df[transactions_df['status'] == 'SUCCESS']
         
-        if 'status' in transactions_df.columns:
-            successful_transactions = len(transactions_df[transactions_df['status'] == 'SUCCESS'])
-            failed_transactions = total_transactions - successful_transactions
-            success_rate = (successful_transactions / total_transactions * 100) if total_transactions > 0 else 0
-        else:
-            successful_transactions = 0
-            failed_transactions = 0
-            success_rate = 0
+        if successful_transactions.empty:
+            st.info("No successful transactions in the selected period")
+            return
         
-        # Amount metrics
-        if 'amount' in transactions_df.columns:
-            total_amount = transactions_df['amount'].sum()
-            avg_amount = transactions_df['amount'].mean() if successful_transactions > 0 else 0
-        else:
-            total_amount = avg_amount = 0
-        
-        # Display metrics
-        col1, col2, col3, col4 = st.columns(4)
+        col1, col2 = st.columns(2)
         
         with col1:
-            st.metric("Total Transactions", f"{total_transactions:,}")
+            # Daily transaction volume
+            daily_transactions = successful_transactions.set_index('created_at').resample('D').size()
+            fig = px.line(
+                x=daily_transactions.index,
+                y=daily_transactions.values,
+                title='Daily Transaction Volume',
+                labels={'x': 'Date', 'y': 'Transactions'}
+            )
+            fig.update_layout(height=300)
+            st.plotly_chart(fig, use_container_width=True)
         
         with col2:
-            st.metric("Successful", f"{successful_transactions:,}")
+            # Transaction value trend
+            daily_value = successful_transactions.set_index('created_at').resample('D')['amount'].sum()
+            fig = px.line(
+                x=daily_value.index,
+                y=daily_value.values,
+                title='Daily Transaction Value',
+                labels={'x': 'Date', 'y': 'Amount (₦)'}
+            )
+            fig.update_layout(height=300)
+            st.plotly_chart(fig, use_container_width=True)
         
-        with col3:
+        # Success rate analysis
+        st.markdown("---")
+        col1, col2, col3 = st.columns(3)
+        
+        with col1:
+            status_counts = transactions_df['status'].value_counts()
+            success_rate = (status_counts.get('SUCCESS', 0) / len(transactions_df)) * 100 if len(transactions_df) > 0 else 0
             st.metric("Success Rate", f"{success_rate:.1f}%")
         
-        with col4:
-            st.metric("Total Amount", f"${total_amount:,.2f}")
-        
-        # Show data preview
-        with st.expander("🔍 View Transaction Data", expanded=False):
-            display_cols = []
-            for col in ['created_at', 'user_identifier', 'product_name', 
-                       'amount', 'status', 'transaction_type', 'service_name']:
-                if col in transactions_df.columns:
-                    display_cols.append(col)
-            
-            if display_cols:
-                st.dataframe(
-                    transactions_df[display_cols].head(100),
-                    column_config={
-                        "created_at": st.column_config.DatetimeColumn("Date", format="YYYY-MM-DD HH:mm"),
-                        "user_identifier": "User ID",
-                        "product_name": "Product",
-                        "amount": st.column_config.NumberColumn("Amount", format="$%,.2f"),
-                        "status": "Status",
-                        "transaction_type": "Type",
-                        "service_name": "Service"
-                    },
-                    hide_index=True,
-                    use_container_width=True
-                )
-                st.caption(f"Showing 100 of {len(transactions_df):,} records")
-    
-    def display_database_diagnostic(self):
-        """Display database diagnostic information"""
-        with st.expander("🔍 Database Diagnostic", expanded=False):
-            st.markdown("### Database Connection Test")
-            
-            if st.button("Test Database Connection", type="secondary"):
-                with st.spinner("Testing connection..."):
-                    result = self.test_connection()
-                    
-                    if result:
-                        col1, col2 = st.columns(2)
-                        
-                        with col1:
-                            if result['transaction_table_exists']:
-                                st.success("✅ Transaction table exists")
-                                st.info(f"Total records: {result['transaction_count']:,}")
-                            else:
-                                st.error("❌ Transaction table NOT found")
-                            
-                        with col2:
-                            if result['onboarding_table_exists']:
-                                st.success("✅ Onboarding table exists")
-                                st.info(f"Total records: {result['onboarding_count']:,}")
-                            else:
-                                st.error("❌ Onboarding table NOT found")
-                        
-                        # Sample queries
-                        st.markdown("### Sample Queries")
-                        
-                        # Try to get sample data
-                        conn = self.connect_db()
-                        if conn:
-                            with conn.cursor() as cursor:
-                                # Get sample from Transaction
-                                if result['transaction_table_exists']:
-                                    cursor.execute("SELECT * FROM Transaction LIMIT 5")
-                                    sample_tx = cursor.fetchall()
-                                    if sample_tx:
-                                        st.markdown("**Transaction sample (first 5 records):**")
-                                        st.json(sample_tx)
-                                
-                                # Get sample from Onboarding
-                                if result['onboarding_table_exists']:
-                                    cursor.execute("SELECT * FROM Onboarding LIMIT 5")
-                                    sample_on = cursor.fetchall()
-                                    if sample_on:
-                                        st.markdown("**Onboarding sample (first 5 records):**")
-                                        st.json(sample_on)
-                                
-                                # Get column names
-                                cursor.execute("SHOW COLUMNS FROM Transaction")
-                                tx_columns = cursor.fetchall()
-                                st.markdown("**Transaction columns:**")
-                                st.write([col['Field'] for col in tx_columns])
-                                
-                                cursor.execute("SHOW COLUMNS FROM Onboarding")
-                                on_columns = cursor.fetchall()
-                                st.markdown("**Onboarding columns:**")
-                                st.write([col['Field'] for col in on_columns])
-                                
-                                conn.close()
-                    else:
-                        st.error("❌ Could not connect to database")
-    
-    def run_dashboard(self):
-        """Main dashboard function"""
-        # Header
-        st.markdown('<h1 class="main-header">Business Development Performance Dashboard</h1>', 
-                   unsafe_allow_html=True)
-        st.markdown("*Real-time analytics for customer acquisition and product performance*")
-        st.markdown("---")
-        
-        # Database diagnostic
-        self.display_database_diagnostic()
-        
-        # Date range selection
-        start_date, end_date, period_type = self.create_period_selector()
-        
-        st.markdown("---")
-        
-        # Load data with progress indicator
-        with st.spinner(f"Loading data from {start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}..."):
-            transactions_df = self.load_transaction_data(start_date, end_date)
-            onboarding_df = self.load_onboarding_data(start_date, end_date)
-        
-        # Data summary
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            st.metric("Transactions Loaded", f"{len(transactions_df):,}")
         with col2:
-            st.metric("Onboarding Records", f"{len(onboarding_df):,}")
+            avg_transaction_value = successful_transactions['amount'].mean()
+            st.metric("Avg Transaction Value", f"₦{avg_transaction_value:,.0f}")
+        
         with col3:
-            days_covered = (end_date - start_date).days + 1
-            st.metric("Period Coverage", f"{days_covered} days")
+            peak_day = successful_transactions.set_index('created_at').resample('D').size().idxmax()
+            peak_day_count = successful_transactions.set_index('created_at').resample('D').size().max()
+            st.metric("Peak Day", f"{peak_day.strftime('%b %d')}: {peak_day_count:,}")
+    
+    def display_trend_analysis(self, transactions_df, onboarding_df):
+        """Display trend analysis"""
+        st.markdown('<div class="sub-header">📈 Trend Analysis</div>', unsafe_allow_html=True)
         
-        # Show data preview if available
-        if not transactions_df.empty:
-            with st.expander("📊 Transaction Data Preview", expanded=False):
-                st.dataframe(transactions_df.head(10))
-        
-        if not onboarding_df.empty:
-            with st.expander("📋 Onboarding Data Preview", expanded=False):
-                st.dataframe(onboarding_df.head(10))
-        
-        # Check if data is loaded
-        if transactions_df.empty and onboarding_df.empty:
-            st.warning("⚠️ No data found for the selected period.")
-            st.info("""
-            **Possible reasons:**
-            1. No data exists in the database for this date range
-            2. Database tables might be empty
-            3. Date columns might have different names
-            4. Database connection issue
-            
-            **Try:**
-            - Select a different date range
-            - Check the Database Diagnostic section above
-            - Verify your database has data for the selected period
-            """)
+        if transactions_df.empty or onboarding_df.empty:
+            st.info("Insufficient data for trend analysis")
             return
         
-        # Display metrics in tabs
-        tab1, tab2, tab3, tab4 = st.tabs([
-            "📊 Executive Overview", 
-            "👥 Customer Acquisition", 
-            "📈 Product Analysis",
-            "💰 Transaction Details"
-        ])
+        # Weekly trends
+        transactions_df['week'] = transactions_df['created_at'].dt.to_period('W').dt.start_time
+        onboarding_df['week'] = onboarding_df['registration_date'].dt.to_period('W').dt.start_time
         
-        with tab1:
-            try:
-                # Calculate executive metrics
-                exec_metrics = self.calculate_executive_snapshot(
-                    transactions_df, onboarding_df, period_type
+        weekly_transactions = transactions_df[transactions_df['status'] == 'SUCCESS'].groupby('week').agg({
+            'amount': 'sum',
+            'id': 'count'
+        }).rename(columns={'id': 'transaction_count', 'amount': 'transaction_value'})
+        
+        weekly_registrations = onboarding_df[onboarding_df['entity'] == 'Customer'].groupby('week').size().reset_index(name='registrations')
+        
+        # Merge data
+        trend_df = weekly_transactions.reset_index().merge(
+            weekly_registrations,
+            on='week',
+            how='outer'
+        ).fillna(0)
+        
+        if len(trend_df) > 1:
+            fig = go.Figure()
+            
+            # Add transaction count trace
+            fig.add_trace(go.Scatter(
+                x=trend_df['week'],
+                y=trend_df['transaction_count'],
+                name='Transaction Count',
+                yaxis='y1',
+                line=dict(color='#1E3A8A', width=3)
+            ))
+            
+            # Add transaction value trace
+            fig.add_trace(go.Scatter(
+                x=trend_df['week'],
+                y=trend_df['transaction_value'],
+                name='Transaction Value (₦)',
+                yaxis='y2',
+                line=dict(color='#10B981', width=3, dash='dash')
+            ))
+            
+            # Add registrations trace
+            fig.add_trace(go.Bar(
+                x=trend_df['week'],
+                y=trend_df['registrations'],
+                name='New Registrations',
+                yaxis='y3',
+                marker_color='#F59E0B',
+                opacity=0.6
+            ))
+            
+            fig.update_layout(
+                title='Weekly Performance Trends',
+                xaxis=dict(title='Week'),
+                yaxis=dict(
+                    title='Transaction Count',
+                    titlefont=dict(color='#1E3A8A'),
+                    tickfont=dict(color='#1E3A8A')
+                ),
+                yaxis2=dict(
+                    title='Transaction Value (₦)',
+                    titlefont=dict(color='#10B981'),
+                    tickfont=dict(color='#10B981'),
+                    anchor='x',
+                    overlaying='y',
+                    side='right'
+                ),
+                yaxis3=dict(
+                    title='New Registrations',
+                    titlefont=dict(color='#F59E0B'),
+                    tickfont=dict(color='#F59E0B'),
+                    anchor='free',
+                    overlaying='y',
+                    side='right',
+                    position=0.95
+                ),
+                height=500,
+                showlegend=True,
+                legend=dict(
+                    yanchor="top",
+                    y=0.99,
+                    xanchor="left",
+                    x=0.01
                 )
-                self.display_executive_snapshot(exec_metrics)
+            )
+            
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.info("Not enough data points for trend analysis")
+    
+    def run_dashboard(self):
+        """Main method to run the dashboard"""
+        # Header
+        st.markdown('<div class="main-header">📊 Business Development Performance Dashboard</div>', unsafe_allow_html=True)
+        
+        # Sidebar filters
+        with st.sidebar:
+            st.markdown("### 🎯 Dashboard Filters")
+            
+            # Date range selection
+            start_date, end_date = self.create_date_filters()
+            
+            # Product filters
+            selected_products = self.create_product_filters()
+            
+            # Load data button
+            st.markdown("---")
+            if st.button("🚀 Load Data", type="primary", use_container_width=True):
+                with st.spinner("Loading data from database..."):
+                    success = self.load_data_from_db(start_date, end_date)
+                    if success:
+                        st.success("Data loaded successfully!")
+            
+            # Data status
+            st.markdown("---")
+            st.markdown("### 📊 Data Status")
+            if st.session_state.data_loaded:
+                if st.session_state.transactions is not None:
+                    st.success(f"✅ Transactions: {len(st.session_state.transactions):,} records")
+                if st.session_state.onboarding is not None:
+                    st.success(f"✅ Onboarding: {len(st.session_state.onboarding):,} records")
+            else:
+                st.info("👈 Click 'Load Data' to begin analysis")
+            
+            # Date range display
+            st.markdown("---")
+            st.markdown(f"**Selected Date Range:**")
+            st.markdown(f"{start_date.strftime('%B %d, %Y')} to {end_date.strftime('%B %d, %Y')}")
+            days_diff = (end_date - start_date).days + 1
+            st.markdown(f"**Duration:** {days_diff} days")
+        
+        # Main content area
+        if st.session_state.data_loaded and st.session_state.transactions is not None:
+            # Executive Snapshot
+            metrics = self.calculate_executive_snapshot(
+                start_date, end_date,
+                st.session_state.transactions,
+                st.session_state.onboarding
+            )
+            self.display_executive_snapshot(metrics)
+            
+            st.markdown('<div class="section-divider"></div>', unsafe_allow_html=True)
+            
+            # Product Performance
+            self.display_product_performance(st.session_state.transactions, selected_products)
+            
+            st.markdown('<div class="section-divider"></div>', unsafe_allow_html=True)
+            
+            # Customer Acquisition
+            self.display_customer_acquisition(st.session_state.onboarding)
+            
+            st.markdown('<div class="section-divider"></div>', unsafe_allow_html=True)
+            
+            # Transaction Analysis
+            self.display_transaction_analysis(st.session_state.transactions)
+            
+            st.markdown('<div class="section-divider"></div>', unsafe_allow_html=True)
+            
+            # Trend Analysis
+            self.display_trend_analysis(st.session_state.transactions, st.session_state.onboarding)
+            
+            # Export options
+            st.markdown('<div class="section-divider"></div>', unsafe_allow_html=True)
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                if st.button("📥 Export Report to CSV", use_container_width=True):
+                    # Export transactions
+                    csv_transactions = st.session_state.transactions.to_csv(index=False)
+                    st.download_button(
+                        label="Download Transaction Data",
+                        data=csv_transactions,
+                        file_name=f"transactions_{start_date.strftime('%Y%m%d')}_{end_date.strftime('%Y%m%d')}.csv",
+                        mime="text/csv",
+                        use_container_width=True
+                    )
+            
+            with col2:
+                if st.button("📥 Export Onboarding Data", use_container_width=True):
+                    # Export onboarding
+                    csv_onboarding = st.session_state.onboarding.to_csv(index=False)
+                    st.download_button(
+                        label="Download Onboarding Data",
+                        data=csv_onboarding,
+                        file_name=f"onboarding_{start_date.strftime('%Y%m%d')}_{end_date.strftime('%Y%m%d')}.csv",
+                        mime="text/csv",
+                        use_container_width=True
+                    )
+            
+            # Data preview
+            with st.expander("🔍 Preview Raw Data"):
+                tab1, tab2 = st.tabs(["Transaction Data", "Onboarding Data"])
                 
-                # Quick insights
-                with st.expander("💡 Quick Insights", expanded=False):
-                    if exec_metrics.get('new_customers_total', 0) > 0:
-                        st.success(f"🎯 **Customer Growth:** {exec_metrics['new_customers_total']:,} new customers acquired")
-                    
-                    if exec_metrics.get('active_customers_all', 0) > 0:
-                        if exec_metrics['new_customers_total'] > 0:
-                            activity_rate = (exec_metrics['active_customers_all'] / exec_metrics['new_customers_total']) * 100
-                            st.info(f"📈 **Activity Rate:** {activity_rate:.1f}% of new customers are active")
-                    
-                    if exec_metrics.get('top_product') != 'N/A':
-                        st.info(f"🏆 **Top Performer:** {exec_metrics['top_product']} leads with {exec_metrics['top_product_count']:,} transactions")
-                    
-                    if exec_metrics.get('total_transactions', 0) == 0:
-                        st.warning("⚠️ **No transactions found** - Check if transaction data exists for this period")
-                        
-            except Exception as e:
-                st.error(f"Error in Executive Overview: {str(e)}")
-                st.info("Please check the data format and try again.")
-        
-        with tab2:
-            try:
-                # Calculate acquisition metrics
-                acquisition_metrics = self.calculate_customer_acquisition(
-                    transactions_df, onboarding_df
-                )
-                self.display_customer_acquisition(acquisition_metrics)
+                with tab1:
+                    st.dataframe(
+                        st.session_state.transactions.head(100),
+                        use_container_width=True,
+                        hide_index=True
+                    )
                 
-                # Acquisition insights
-                with st.expander("🎯 Acquisition Insights", expanded=False):
-                    if acquisition_metrics['new_registrations_total'] > 0:
-                        conversion_rate = (acquisition_metrics['ftt'] / acquisition_metrics['new_registrations_total']) * 100
-                        st.metric("Registration to FTT Conversion", f"{conversion_rate:.1f}%")
-                        
-                        kyc_rate = (acquisition_metrics['kyc_completed'] / acquisition_metrics['new_registrations_total']) * 100
-                        st.metric("KYC Completion Rate", f"{kyc_rate:.1f}%")
-            except Exception as e:
-                st.error(f"Error in Customer Acquisition: {str(e)}")
+                with tab2:
+                    st.dataframe(
+                        st.session_state.onboarding.head(100),
+                        use_container_width=True,
+                        hide_index=True
+                    )
         
-        with tab3:
-            try:
-                # Calculate product metrics
-                product_metrics = self.calculate_product_metrics(transactions_df)
-                self.display_product_analysis(product_metrics)
-            except Exception as e:
-                st.error(f"Error in Product Analysis: {str(e)}")
-        
-        with tab4:
-            try:
-                self.display_transaction_analysis(transactions_df)
-            except Exception as e:
-                st.error(f"Error in Transaction Details: {str(e)}")
-        
-        # Footer
-        st.markdown("---")
-        st.markdown(
-            """
-            <div style='text-align: center; color: #6B7280; font-size: 0.9rem; padding: 2rem;'>
-                <p>📊 <strong>Business Development Performance Dashboard</strong> | Version 2.1</p>
-                <p>📍 Real-time analytics powered by MySQL | Last updated: {}</p>
-                <p>📧 For support: analytics@company.com</p>
-            </div>
-            """.format(datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
-            unsafe_allow_html=True
-        )
+        else:
+            # Welcome/instructions
+            st.info("👈 Use the sidebar to select a date range and load data from the database")
+            
+            col1, col2, col3 = st.columns(3)
+            
+            with col1:
+                st.markdown("### 📈 Key Features")
+                st.markdown("""
+                - Flexible date range selection
+                - Real-time MySQL data loading
+                - Product performance analysis
+                - Customer acquisition tracking
+                - Transaction trend visualization
+                - Export capabilities
+                """)
+            
+            with col2:
+                st.markdown("### 🎯 Metrics Tracked")
+                st.markdown("""
+                - New customer registrations
+                - Active customer count
+                - Transaction volume & value
+                - Product usage patterns
+                - KYC completion rates
+                - Success rates
+                """)
+            
+            with col3:
+                st.markdown("### 📊 Visualizations")
+                st.markdown("""
+                - Interactive charts
+                - Trend analysis
+                - Product comparisons
+                - Performance dashboards
+                - Custom date ranges
+                - Real-time updates
+                """)
+            
+            # Sample visualization placeholder
+            st.markdown('<div class="section-divider"></div>', unsafe_allow_html=True)
+            st.markdown("### 📋 Sample Dashboard Preview")
+            
+            # Create sample data for preview
+            sample_dates = pd.date_range(start=datetime.now() - timedelta(days=30), end=datetime.now(), freq='D')
+            sample_data = pd.DataFrame({
+                'date': sample_dates,
+                'transactions': np.random.randint(100, 500, len(sample_dates)),
+                'registrations': np.random.randint(10, 50, len(sample_dates))
+            })
+            
+            fig = px.line(
+                sample_data,
+                x='date',
+                y=['transactions', 'registrations'],
+                title='Sample: Daily Transactions & Registrations',
+                labels={'value': 'Count', 'date': 'Date'},
+                color_discrete_sequence=['#1E3A8A', '#10B981']
+            )
+            fig.update_layout(height=400)
+            st.plotly_chart(fig, use_container_width=True)
 
+# Main execution
 def main():
-    """Main function to run the dashboard"""
-    try:
-        # Initialize dashboard
-        dashboard = PerformanceDashboard()
-        
-        # Run dashboard
-        dashboard.run_dashboard()
-        
-    except Exception as e:
-        st.error(f"🚨 Dashboard Error: {str(e)}")
-        st.info("""
-        **Please try these steps:**
-        1. Refresh the page
-        2. Check your internet connection
-        3. Verify database credentials are correct
-        4. Contact support if the issue persists
-        """)
+    # Initialize dashboard
+    dashboard = PerformanceDashboard()
+    
+    # Run dashboard
+    dashboard.run_dashboard()
 
 if __name__ == "__main__":
     main()
